@@ -1,0 +1,4 @@
+[
+  { "import": "vanity.example.com/team/*",  "origin": "https://git.example.com/team/*",  "github": "https://github.com/my-github-org/*" },
+  { "import": "vanity.example.com/other/*", "origin": "https://git.example.com/other/*" }
+]

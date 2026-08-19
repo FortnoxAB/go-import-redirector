@@ -61,31 +61,58 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"net/url"
 	"strings"
+	"time"
+
+	"github.com/fortnoxab/go-import-redirector/githubprobe"
 )
 
 var (
-	addr       = flag.String("addr", ":http", "serve http on `address`")
-	vcs        = flag.String("vcs", "git", "set version control `system`")
-	godocURL   = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
-	importPath string
-	repoPath   string
-	wildcard   int
+	addr               = flag.String("addr", ":http", "serve http on `address`")
+	vcs                = flag.String("vcs", "git", "set version control `system`")
+	godocURL           = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
+	config             = flag.String("config", "", "path to JSON config file (see redirects.example.json)")
+	githubCacheTTL     = flag.Duration("github-probe-cache-ttl", 10*time.Minute, "how long to cache GitHub probe results")
+	githubProbeTimeout = flag.Duration("github-probe-timeout", 5*time.Second, "timeout per GitHub API probe")
 )
 
+type configEntry struct {
+	Import string `json:"import"`
+	Origin string `json:"origin"`
+	Github string `json:"github,omitempty"`
+}
+
+type mapping struct {
+	importPath string
+	originPath string
+	wildcard   int
+	githubOrg  string
+}
+
+// githubLooker is satisfied by *githubprobe.Prober; separated for test injection.
+type githubLooker interface {
+	Lookup(ctx context.Context, org, repo string) (string, bool)
+}
+
+var githubProber githubLooker
+
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: go-import-redirector <import> <repo>\n")
+	fmt.Fprintf(os.Stderr, "usage: go-import-redirector [-config file] [<import> <origin>]\n")
 	fmt.Fprintf(os.Stderr, "options:\n")
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, "examples:\n")
+	fmt.Fprintf(os.Stderr, "\tgo-import-redirector -config redirects.json\n")
 	fmt.Fprintf(os.Stderr, "\tgo-import-redirector rsc.io/* https://github.com/rsc/*\n")
-	fmt.Fprintf(os.Stderr, "\tgo-import-redirector 9fans.net/go https://github.com/9fans/go\n")
 	os.Exit(2)
 }
 
@@ -93,31 +120,91 @@ func main() {
 	log.SetPrefix("go-import-redirector: ")
 	flag.Usage = usage
 	flag.Parse()
-	if flag.NArg() != 2 {
-		flag.Usage()
-	}
-	importPath = flag.Arg(0)
-	repoPath = flag.Arg(1)
-	if !strings.Contains(repoPath, "://") {
-		log.Fatal("repo path must be full URL")
-	}
-	if strings.HasSuffix(importPath, "/*") != strings.HasSuffix(repoPath, "/*") {
-		log.Fatal("either both import and repo must have /* or neither")
-	}
-	for strings.HasSuffix(importPath, "/*") {
-		wildcard++
-		importPath = strings.TrimSuffix(importPath, "/*")
-		repoPath = strings.TrimSuffix(repoPath, "/*")
-	}
-
 	*godocURL = strings.TrimRight(*godocURL, "/")
 
-	http.HandleFunc(strings.TrimSuffix(importPath, "/")+"/", redirect)
-	http.HandleFunc(importPath+"/.ping", pong) // non-redirecting URL for debugging TLS certificates
-	err := http.ListenAndServe(*addr, nil)
-	if err != nil {
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		githubProber = githubprobe.New(token, *githubCacheTTL, *githubProbeTimeout)
+		log.Printf("GitHub probing enabled via token (cache TTL: %v)", *githubCacheTTL)
+	}
+
+	if appIDStr := os.Getenv("GITHUB_APP_ID"); appIDStr != "" {
+		appID, _ := strconv.ParseInt(appIDStr, 10, 64)
+		var pem []byte
+		if f := os.Getenv("GITHUB_APP_PRIVATE_KEY_FILE"); f != "" {
+			var err error
+			if pem, err = os.ReadFile(f); err != nil {
+				log.Fatalf("reading GitHub App private key: %v", err)
+			}
+		} else if p := os.Getenv("GITHUB_APP_PRIVATE_KEY"); p != "" {
+			pem = []byte(p)
+		}
+		if appID == 0 || len(pem) == 0 {
+			log.Fatal("GITHUB_APP_ID requires GITHUB_APP_PRIVATE_KEY / GITHUB_APP_PRIVATE_KEY_FILE")
+		}
+		prober, err := githubprobe.NewWithAppKey(appID, pem, *githubCacheTTL, *githubProbeTimeout)
+		if err != nil {
+			log.Fatalf("GitHub App auth: %v", err)
+		}
+		githubProber = prober
+		log.Printf("GitHub probing enabled via GitHub App %d (cache TTL: %v)", appID, *githubCacheTTL)
+	}
+
+	if *config != "" {
+		f, err := os.Open(*config)
+		if err != nil {
+			log.Printf("warning: cannot open config %s: %v; starting with no routes", *config, err)
+		} else {
+			defer f.Close()
+			var entries []configEntry
+			if err := json.NewDecoder(f).Decode(&entries); err != nil {
+				log.Fatalf("parsing config: %v", err)
+			}
+			for _, e := range entries {
+				registerMapping(parseMapping(e.Import, e.Origin, e.Github))
+			}
+		}
+	} else if flag.NArg() == 2 {
+		registerMapping(parseMapping(flag.Arg(0), flag.Arg(1), ""))
+	} else {
+		log.Print("no -config or import/origin args provided; starting with no routes registered")
+	}
+
+	if err := http.ListenAndServe(*addr, nil); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func parseMapping(imp, origin, github string) mapping {
+	if !strings.Contains(origin, "://") {
+		log.Fatalf("origin must be a full URL: %s", origin)
+	}
+	if strings.HasSuffix(imp, "/*") != strings.HasSuffix(origin, "/*") {
+		log.Fatalf("either both import and origin must have /* or neither: %s %s", imp, origin)
+	}
+	var githubOrg string
+	if github != "" {
+		u, err := url.Parse(strings.TrimSuffix(github, "/*"))
+		if err != nil {
+			log.Fatalf("github must be a URL like https://github.com/org/*: %s", github)
+		}
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if len(parts) == 0 || parts[0] == "" {
+			log.Fatalf("github must be a URL like https://github.com/org/*: %s", github)
+		}
+		githubOrg = parts[0]
+	}
+	m := mapping{importPath: imp, originPath: origin, githubOrg: githubOrg}
+	for strings.HasSuffix(m.importPath, "/*") {
+		m.wildcard++
+		m.importPath = strings.TrimSuffix(m.importPath, "/*")
+		m.originPath = strings.TrimSuffix(m.originPath, "/*")
+	}
+	return m
+}
+
+func registerMapping(m mapping) {
+	http.HandleFunc(strings.TrimSuffix(m.importPath, "/")+"/", makeHandler(m))
+	http.HandleFunc(m.importPath+"/.ping", pong)
 }
 
 var tmpl = template.Must(template.New("main").Parse(`<!DOCTYPE html>
@@ -141,56 +228,78 @@ type data struct {
 	GoDocURL   string
 }
 
-func redirect(w http.ResponseWriter, req *http.Request) {
-	path := strings.TrimSuffix(req.Host+req.URL.Path, "/")
-	var importRoot, repoRoot, suffix string
-	if wildcard > 0 {
-		if path == importPath {
-			http.Redirect(w, req, *godocURL+"/"+importPath, http.StatusFound)
-			return
-		}
-		if !strings.HasPrefix(path, importPath+"/") {
-			http.NotFound(w, req)
-			return
-		}
-		elem := path[len(importPath)+1:]
-		if parts := strings.Split(elem, "/"); len(parts) >= wildcard {
-			elem = strings.Join(parts[:wildcard], "/")
-			suffix = strings.Join(parts[wildcard:], "/")
-			if suffix != "" {
-				suffix = "/" + suffix
+func makeHandler(m mapping) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		path := strings.TrimSuffix(req.Host+req.URL.Path, "/")
+		var importRoot, repoRoot, suffix string
+		if m.wildcard > 0 {
+			if path == m.importPath {
+				http.Redirect(w, req, *godocURL+"/"+m.importPath, http.StatusFound)
+				return
 			}
+			if !strings.HasPrefix(path, m.importPath+"/") {
+				http.NotFound(w, req)
+				return
+			}
+			elem := path[len(m.importPath)+1:]
+			if parts := strings.Split(elem, "/"); len(parts) >= m.wildcard {
+				elem = strings.Join(parts[:m.wildcard], "/")
+				suffix = strings.Join(parts[m.wildcard:], "/")
+				if suffix != "" {
+					suffix = "/" + suffix
+				}
+			} else {
+				http.NotFound(w, req)
+				return
+			}
+			importRoot = m.importPath + "/" + elem
+			repoRoot = m.originPath + "/" + elem
 		} else {
-			http.NotFound(w, req)
+			if path != m.importPath && !strings.HasPrefix(path, m.importPath+"/") {
+				http.NotFound(w, req)
+				return
+			}
+			importRoot = m.importPath
+			repoRoot = m.originPath
+			suffix = path[len(m.importPath):]
+		}
+		vcsRoot := repoRoot
+		vcsType := *vcs
+		if githubProber != nil && m.githubOrg != "" {
+			if name := repoNameFromRoot(importRoot, m.importPath); name != "" {
+				if ghURL, ok := githubProber.Lookup(req.Context(), m.githubOrg, name); ok {
+					vcsRoot = ghURL
+					vcsType = "git"
+				}
+			}
+		}
+		d := &data{
+			ImportRoot: importRoot,
+			VCS:        vcsType,
+			VCSRoot:    vcsRoot,
+			Suffix:     suffix,
+			GoDocURL:   *godocURL,
+		}
+		var buf bytes.Buffer
+		if err := tmpl.Execute(&buf, d); err != nil {
+			http.Error(w, err.Error(), 500)
 			return
 		}
-		importRoot = importPath + "/" + elem
-		repoRoot = repoPath + "/" + elem
-	} else {
-		if path != importPath && !strings.HasPrefix(path, importPath+"/") {
-			http.NotFound(w, req)
-			return
-		}
-		importRoot = importPath
-		repoRoot = repoPath
-		suffix = path[len(importPath):]
+		w.Write(buf.Bytes())
 	}
-	d := &data{
-		ImportRoot: importRoot,
-		VCS:        *vcs,
-		VCSRoot:    repoRoot,
-		Suffix:     suffix,
-		GoDocURL:   *godocURL,
-	}
-	var buf bytes.Buffer
-	err := tmpl.Execute(&buf, d)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	w.Write(buf.Bytes())
 }
 
 func pong(w http.ResponseWriter, req *http.Request) {
 	fmt.Fprintf(w, "pong")
+}
+
+// repoNameFromRoot returns the bare repo name from importRoot by stripping the
+// importPath prefix. Returns "" for non-wildcard mappings.
+func repoNameFromRoot(importRoot, importPath string) string {
+	if !strings.HasPrefix(importRoot, importPath+"/") {
+		return ""
+	}
+	after := importRoot[len(importPath)+1:]
+	parts := strings.Split(after, "/")
+	return parts[len(parts)-1]
 }
