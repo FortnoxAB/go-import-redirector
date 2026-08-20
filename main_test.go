@@ -9,22 +9,21 @@ import (
 )
 
 type fakeProber struct {
-	hits  map[string]string // repo → GitHub URL; missing key = miss
+	hits  map[string]bool // repoURL → exists
 	calls []string
 }
 
-func (f *fakeProber) Lookup(_ context.Context, _ string, repo string) (string, bool) {
-	f.calls = append(f.calls, repo)
-	url, ok := f.hits[repo]
-	return url, ok
+func (f *fakeProber) Probe(_ context.Context, repoURL string) bool {
+	f.calls = append(f.calls, repoURL)
+	return f.hits[repoURL]
 }
 
-func setProber(t *testing.T, hits map[string]string) *fakeProber {
+func setProber(t *testing.T, hits map[string]bool) *fakeProber {
 	t.Helper()
 	fp := &fakeProber{hits: hits}
-	orig := githubProber
-	githubProber = fp
-	t.Cleanup(func() { githubProber = orig })
+	orig := prober
+	prober = fp
+	t.Cleanup(func() { prober = orig })
 	return fp
 }
 
@@ -46,14 +45,14 @@ func assertGoImport(t *testing.T, body, importRoot, vcs, vcsRoot string) {
 }
 
 func TestHandlerProberDisabled(t *testing.T) {
-	githubProber = nil
+	prober = nil
 	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
 	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@git.example.com/team/myrepo")
 }
 
 func TestHandlerProberHit(t *testing.T) {
-	setProber(t, map[string]string{"myrepo": "ssh://git@github.com/my-org/myrepo"})
+	setProber(t, map[string]bool{"ssh://git@github.com/my-org/myrepo": true})
 	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
 	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@github.com/my-org/myrepo")
@@ -67,15 +66,15 @@ func TestHandlerProberMiss(t *testing.T) {
 }
 
 func TestHandlerMajorVersionSuffix(t *testing.T) {
-	setProber(t, map[string]string{"myrepo": "ssh://git@github.com/my-org/myrepo"})
+	setProber(t, map[string]bool{"ssh://git@github.com/my-org/myrepo": true})
 	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
 	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo/v2")
 	// importRoot must be the repo root, not include /v2
 	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@github.com/my-org/myrepo")
 }
 
-func TestHandlerNoGithubOrgSkipsProber(t *testing.T) {
-	fp := setProber(t, map[string]string{"myrepo": "ssh://git@github.com/my-org/myrepo"})
+func TestHandlerSingleRepoSkipsProber(t *testing.T) {
+	fp := setProber(t, map[string]bool{"ssh://git@github.com/my-org/myrepo": true})
 	m := parseMapping("go.example.com/team/*", []string{"ssh://git@git.example.com/team/*"})
 	handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	if len(fp.calls) != 0 {
@@ -84,7 +83,7 @@ func TestHandlerNoGithubOrgSkipsProber(t *testing.T) {
 }
 
 func TestHandlerNonWildcardSkipsProber(t *testing.T) {
-	fp := setProber(t, map[string]string{"myrepo": "ssh://git@github.com/my-org/myrepo"})
+	fp := setProber(t, map[string]bool{"ssh://git@github.com/my-org/myrepo": true})
 	m := parseMapping("go.example.com/team/myrepo", []string{"ssh://git@github.com/my-org/myrepo", "ssh://git@git.example.com/team/myrepo"})
 	handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	if len(fp.calls) != 0 {
@@ -92,21 +91,3 @@ func TestHandlerNonWildcardSkipsProber(t *testing.T) {
 	}
 }
 
-func TestRepoNameFromRoot(t *testing.T) {
-	tests := []struct {
-		importRoot string
-		importPath string
-		want       string
-	}{
-		{"go.example.com/team/myrepo", "go.example.com/team", "myrepo"},
-		{"go.example.com/team/myrepo", "go.example.com/team/myrepo", ""},
-		{"go.example.com/a/b/myrepo", "go.example.com/a", "myrepo"},
-	}
-	for _, tc := range tests {
-		got := repoNameFromRoot(tc.importRoot, tc.importPath)
-		if got != tc.want {
-			t.Errorf("repoNameFromRoot(%q, %q) = %q, want %q",
-				tc.importRoot, tc.importPath, got, tc.want)
-		}
-	}
-}

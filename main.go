@@ -69,8 +69,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
-	"net/url"
 	"strings"
 	"time"
 
@@ -82,8 +80,8 @@ var (
 	vcs                = flag.String("vcs", "git", "set version control `system`")
 	godocURL           = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
 	config             = flag.String("config", "", "path to JSON config file (see redirects.example.json)")
-	githubCacheTTL     = flag.Duration("github-probe-cache-ttl", 10*time.Minute, "how long to cache GitHub probe results")
-	githubProbeTimeout = flag.Duration("github-probe-timeout", 5*time.Second, "timeout per GitHub API probe")
+	probeCacheTTL     = flag.Duration("probe-cache-ttl", 10*time.Minute, "how long to cache git ls-remote probe results")
+	probeTimeout      = flag.Duration("probe-timeout", 5*time.Second, "timeout per git ls-remote probe")
 )
 
 type configEntry struct {
@@ -93,16 +91,16 @@ type configEntry struct {
 
 type mapping struct {
 	importPath string
-	repoPaths  []string // wildcard stripped, ordered; github.com entries probed first
+	repoPaths  []string // wildcard stripped, ordered; non-last entries are probed
 	wildcard   int
 }
 
-// githubLooker is satisfied by *githubprobe.Prober; separated for test injection.
-type githubLooker interface {
-	Lookup(ctx context.Context, org, repo string) (string, bool)
+// repoProber is satisfied by *githubprobe.Prober; separated for test injection.
+type repoProber interface {
+	Probe(ctx context.Context, repoURL string) bool
 }
 
-var githubProber githubLooker
+var prober repoProber
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage: go-import-redirector [-config file] [<import> <origin>]\n")
@@ -120,32 +118,8 @@ func main() {
 	flag.Parse()
 	*godocURL = strings.TrimRight(*godocURL, "/")
 
-	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-		githubProber = githubprobe.New(token, *githubCacheTTL, *githubProbeTimeout)
-		log.Printf("GitHub probing enabled via token (cache TTL: %v)", *githubCacheTTL)
-	}
-
-	if appIDStr := os.Getenv("GITHUB_APP_ID"); appIDStr != "" {
-		appID, _ := strconv.ParseInt(appIDStr, 10, 64)
-		var pem []byte
-		if f := os.Getenv("GITHUB_APP_PRIVATE_KEY_FILE"); f != "" {
-			var err error
-			if pem, err = os.ReadFile(f); err != nil {
-				log.Fatalf("reading GitHub App private key: %v", err)
-			}
-		} else if p := os.Getenv("GITHUB_APP_PRIVATE_KEY"); p != "" {
-			pem = []byte(p)
-		}
-		if appID == 0 || len(pem) == 0 {
-			log.Fatal("GITHUB_APP_ID requires GITHUB_APP_PRIVATE_KEY / GITHUB_APP_PRIVATE_KEY_FILE")
-		}
-		prober, err := githubprobe.NewWithAppKey(appID, pem, *githubCacheTTL, *githubProbeTimeout)
-		if err != nil {
-			log.Fatalf("GitHub App auth: %v", err)
-		}
-		githubProber = prober
-		log.Printf("GitHub probing enabled via GitHub App %d (cache TTL: %v)", appID, *githubCacheTTL)
-	}
+	prober = githubprobe.New(*probeCacheTTL, *probeTimeout)
+	log.Printf("git SSH probing enabled (cache TTL: %v, timeout: %v)", *probeCacheTTL, *probeTimeout)
 
 	if *config != "" {
 		f, err := os.Open(*config)
@@ -193,19 +167,6 @@ func parseMapping(imp string, repos []string) mapping {
 		}
 	}
 	return m
-}
-
-// githubOrgFromRepoPath returns the GitHub org if repoPath is a github.com URL.
-func githubOrgFromRepoPath(repoPath string) (org string, isGitHub bool) {
-	u, err := url.Parse(repoPath)
-	if err != nil || u.Hostname() != "github.com" {
-		return "", false
-	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) == 0 || parts[0] == "" {
-		return "", false
-	}
-	return parts[0], true
 }
 
 func registerMapping(m mapping) {
@@ -287,45 +248,27 @@ func makeHandler(m mapping) http.HandlerFunc {
 }
 
 // resolveRepoPath tries each configured repoPath in order.
-// GitHub URLs are probed via the API; the first hit wins.
-// Non-GitHub URLs are served directly. The last entry is always a fallback.
+// Non-last entries are probed via git ls-remote; the last entry is always a fallback.
 func resolveRepoPath(req *http.Request, m mapping, importRoot, elem string) string {
 	for i, rp := range m.repoPaths {
 		candidate := rp
 		if m.wildcard > 0 {
 			candidate = rp + "/" + elem
 		}
-		org, isGH := githubOrgFromRepoPath(rp)
 		isLast := i == len(m.repoPaths)-1
-		if !isGH {
-			return candidate
-		}
-		// GitHub entry: probe if possible
-		if githubProber != nil && m.wildcard > 0 {
-			if name := repoNameFromRoot(importRoot, m.importPath); name != "" {
-				if _, ok := githubProber.Lookup(req.Context(), org, name); ok {
+		if !isLast {
+			if prober != nil && m.wildcard > 0 {
+				if prober.Probe(req.Context(), candidate) {
 					return candidate
 				}
 			}
+			continue
 		}
-		if isLast {
-			return candidate // last resort
-		}
+		return candidate
 	}
 	return m.repoPaths[len(m.repoPaths)-1] // unreachable
 }
 
 func pong(w http.ResponseWriter, req *http.Request) {
 	fmt.Fprintf(w, "pong")
-}
-
-// repoNameFromRoot returns the bare repo name from importRoot by stripping the
-// importPath prefix. Returns "" for non-wildcard mappings.
-func repoNameFromRoot(importRoot, importPath string) string {
-	if !strings.HasPrefix(importRoot, importPath+"/") {
-		return ""
-	}
-	after := importRoot[len(importPath)+1:]
-	parts := strings.Split(after, "/")
-	return parts[len(parts)-1]
 }

@@ -2,131 +2,95 @@ package githubprobe
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"strings"
+	"os/exec"
 	"sync"
 	"testing"
 	"time"
 )
 
-type testGitHub struct {
-	mu        sync.Mutex
-	responses map[string]int // "org/repo" → status code; default 404
-	calls     map[string]int
-}
-
-func (g *testGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/repos/")
-	g.mu.Lock()
-	g.calls[path]++
-	code, ok := g.responses[path]
-	g.mu.Unlock()
-	if !ok {
-		code = http.StatusNotFound
-	}
-	w.WriteHeader(code)
-}
-
-func (g *testGitHub) callCount(org, repo string) int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.calls[org+"/"+repo]
-}
-
-func newTestProber(t *testing.T, responses map[string]int, ttl time.Duration) (*Prober, *testGitHub) {
+func skipIfNoGit(t *testing.T) {
 	t.Helper()
-	gh := &testGitHub{responses: responses, calls: make(map[string]int)}
-	srv := httptest.NewServer(gh)
-	t.Cleanup(srv.Close)
-	p := New("test-token", ttl, 2*time.Second)
-	p.baseURL = srv.URL
-	return p, gh
-}
-
-func TestLookupFound(t *testing.T) {
-	p, _ := newTestProber(t, map[string]int{"orgA/myrepo": 200}, time.Hour)
-	url, ok := p.Lookup(context.Background(), "orgA", "myrepo")
-	if !ok {
-		t.Fatal("expected found")
-	}
-	if url != "https://github.com/orgA/myrepo" {
-		t.Errorf("url = %q", url)
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not in PATH")
 	}
 }
 
-func TestLookupNotFound(t *testing.T) {
-	p, _ := newTestProber(t, nil, time.Hour)
-	_, ok := p.Lookup(context.Background(), "orgA", "myrepo")
-	if ok {
-		t.Fatal("expected not found")
+func initRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := exec.Command("git", "init", dir).Run(); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestProbeFound(t *testing.T) {
+	skipIfNoGit(t)
+	url := "file://" + initRepo(t)
+	p := New(time.Hour, 5*time.Second)
+	if !p.Probe(context.Background(), url) {
+		t.Error("expected repo to be found")
 	}
 }
 
-func TestLookupCachesHit(t *testing.T) {
-	p, gh := newTestProber(t, map[string]int{"orgA/myrepo": 200}, time.Hour)
-	p.Lookup(context.Background(), "orgA", "myrepo")
-	p.Lookup(context.Background(), "orgA", "myrepo")
-	if gh.callCount("orgA", "myrepo") != 1 {
-		t.Errorf("expected 1 HTTP call, got %d", gh.callCount("orgA", "myrepo"))
+func TestProbeNotFound(t *testing.T) {
+	skipIfNoGit(t)
+	p := New(time.Hour, 5*time.Second)
+	if p.Probe(context.Background(), "file:///this-path-does-not-exist") {
+		t.Error("expected repo not found")
 	}
 }
 
-func TestLookupCachesMiss(t *testing.T) {
-	p, gh := newTestProber(t, nil, time.Hour)
-	p.Lookup(context.Background(), "orgA", "myrepo")
-	p.Lookup(context.Background(), "orgA", "myrepo")
-	if gh.callCount("orgA", "myrepo") != 1 {
-		t.Errorf("negative result should be cached; expected 1 call, got %d", gh.callCount("orgA", "myrepo"))
+func TestProbeCachesHit(t *testing.T) {
+	skipIfNoGit(t)
+	url := "file://" + initRepo(t)
+	p := New(time.Hour, 5*time.Second)
+	p.Probe(context.Background(), url)
+	p.Probe(context.Background(), url)
+	p.mu.RLock()
+	e, ok := p.cache[url]
+	p.mu.RUnlock()
+	if !ok || !e.exists {
+		t.Error("expected positive result to be cached")
 	}
 }
 
-func TestLookupCacheExpiry(t *testing.T) {
-	p, gh := newTestProber(t, map[string]int{"orgA/myrepo": 200}, 10*time.Millisecond)
-	p.Lookup(context.Background(), "orgA", "myrepo")
+func TestProbeCachesMiss(t *testing.T) {
+	skipIfNoGit(t)
+	const url = "file:///nonexistent-path-cache-test"
+	p := New(time.Hour, 5*time.Second)
+	p.Probe(context.Background(), url)
+	p.mu.RLock()
+	e, ok := p.cache[url]
+	p.mu.RUnlock()
+	if !ok || e.exists {
+		t.Error("expected negative result to be cached")
+	}
+}
+
+func TestProbeCacheExpiry(t *testing.T) {
+	skipIfNoGit(t)
+	url := "file://" + initRepo(t)
+	p := New(10*time.Millisecond, 5*time.Second)
+	p.Probe(context.Background(), url)
 	time.Sleep(20 * time.Millisecond)
-	p.Lookup(context.Background(), "orgA", "myrepo")
-	if gh.callCount("orgA", "myrepo") != 2 {
-		t.Errorf("expected re-probe after expiry, got %d calls", gh.callCount("orgA", "myrepo"))
+	// seed expired negative entry to verify re-probe happens
+	p.mu.Lock()
+	p.cache[url] = cacheEntry{exists: false, expires: time.Now().Add(-time.Second)}
+	p.mu.Unlock()
+	if !p.Probe(context.Background(), url) {
+		t.Error("expected expired cache to trigger re-probe and find repo")
 	}
 }
 
-func TestLookupErrorTreatedAsNotFound(t *testing.T) {
-	p, _ := newTestProber(t, map[string]int{"orgA/myrepo": 500}, time.Hour)
-	_, ok := p.Lookup(context.Background(), "orgA", "myrepo")
-	if ok {
-		t.Error("500 should be treated as not-found")
-	}
-}
-
-func TestLookupContextCancelled(t *testing.T) {
-	slow := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(200 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
-	})
-	srv := httptest.NewServer(slow)
-	t.Cleanup(srv.Close)
-	p := New("", time.Hour, 2*time.Second)
-	p.baseURL = srv.URL
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-
-	_, ok := p.Lookup(ctx, "orgA", "myrepo")
-	if ok {
-		t.Error("expected not found on cancelled context")
-	}
-}
-
-func TestLookupConcurrency(t *testing.T) {
-	p, _ := newTestProber(t, map[string]int{"orgA/myrepo": 200}, time.Hour)
+func TestProbeConcurrent(t *testing.T) {
+	skipIfNoGit(t)
+	url := "file://" + initRepo(t)
+	p := New(time.Hour, 5*time.Second)
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
+	for range 10 {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			p.Lookup(context.Background(), "orgA", "myrepo")
-		}()
+		go func() { defer wg.Done(); p.Probe(context.Background(), url) }()
 	}
 	wg.Wait()
 }

@@ -1,6 +1,6 @@
 # go-import-redirector
 
-An HTTP service that implements Go's [vanity import path](https://pkg.go.dev/cmd/go#hdr-Remote_import_paths) protocol. It serves `go-import` meta tags so that `go get` can resolve custom import paths (e.g. `go.example.com/team/myrepo`) to the actual VCS repository — whether it lives on a self-hosted Git server or on GitHub.
+An HTTP service that implements Go's [vanity import path](https://pkg.go.dev/cmd/go#hdr-Remote_import_paths) protocol. It serves `go-import` meta tags so that `go get` can resolve custom import paths (e.g. `go.fnox.se/gl/myrepo`) to the actual VCS repository.
 
 ## How it works
 
@@ -13,16 +13,16 @@ GET https://go.example.com/team/myrepo?go-get=1
 The redirector responds with a `go-import` meta tag:
 
 ```html
-<meta name="go-import" content="go.example.com/team/myrepo git https://github.com/my-org/myrepo">
+<meta name="go-import" content="go.example.com/team/myrepo git ssh://git@github.com/my-org/myrepo">
 ```
 
 For each request the service:
 
 1. Matches the import path against the configured mappings.
-2. If a `github_org` is configured for that mapping and `GITHUB_TOKEN` is set, probes `api.github.com/repos/{github_org}/{repo}` to check whether the repository has been migrated to GitHub.
-3. On a GitHub hit → serves the GitHub HTTPS URL. On a miss or no token → serves the `origin` URL from the config.
+2. For each entry in `repoPaths` (in order), runs `git ls-remote <url>` to check if the repository is reachable.
+3. Returns the first reachable URL. The last entry is always served as a fallback without probing.
 
-Probe results (both found and not-found) are cached for the duration of `-github-probe-cache-ttl` (default 10 minutes), so `go mod download` over a large dependency graph does not fan out into repeated API calls.
+Probe results are cached for `-probe-cache-ttl` (default 10 minutes), so `go mod download` over a large dependency graph does not fan out into repeated SSH calls.
 
 ## Configuration
 
@@ -30,36 +30,55 @@ Copy `redirects.example.json` to `redirects.json` (which is git-ignored) and fil
 
 ```json
 [
-  { "import": "go.example.com/team/*",  "origin": "https://git.example.com/team/*",  "github": "https://github.com/my-github-org/*" },
-  { "import": "go.example.com/other/*", "origin": "https://git.example.com/other/*" }
+  { "importPath": "go.example.com/team/*", "repoPaths": [
+      "ssh://git@github.com/my-org/*",
+      "ssh://git@git.example.com/team/*"
+  ]},
+  { "importPath": "go.example.com/other/*", "repoPaths": [
+      "ssh://git@git.example.com/other/*"
+  ]}
 ]
 ```
 
 | Field | Required | Description |
 |---|---|---|
-| `import` | yes | Vanity import path prefix. Supports `/*` wildcard. |
-| `origin` | yes | Fallback VCS URL. Must be a full URL; supports `/*` to match the wildcard. |
-| `github` | no | GitHub URL to probe, e.g. `https://github.com/my-org/*`. Omit to disable GitHub probing for this mapping. |
+| `importPath` | yes | Vanity import path prefix. Supports `/*` wildcard. |
+| `repoPaths` | yes | Ordered list of candidate VCS URLs. Each must be a full URL and use the same wildcard pattern as `importPath`. The first reachable entry wins; the last is always the fallback. |
 
-Wildcard expansion strips the last segment of `origin` and replaces it with the matched repo name. A request for `go.example.com/team/myrepo/v2` produces `importRoot = go.example.com/team/myrepo` and serves the correct repo regardless of major version suffix.
+A request for `go.example.com/team/myrepo/v2` produces `importRoot = go.example.com/team/myrepo` regardless of major version suffix.
 
-Non-wildcard entries take precedence over wildcard entries due to Go's mux longest-prefix rule, so you can override individual repos:
+Non-wildcard entries take precedence over wildcard entries due to Go's mux longest-prefix rule:
 
 ```json
-{ "import": "go.example.com/team/myrepo", "origin": "https://github.com/my-org/myrepo" }
+{ "importPath": "go.example.com/team/myrepo", "repoPaths": ["ssh://git@github.com/my-org/myrepo"] }
 ```
+
+## SSH configuration
+
+The service uses the system SSH config by default. To use a specific deploy key, set `GIT_SSH_COMMAND`:
+
+```sh
+export GIT_SSH_COMMAND="ssh -i /path/to/deploy-key -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+```
+
+In Kubernetes, mount the key as a Secret and pass the env var:
+
+```yaml
+env:
+  - name: GIT_SSH_COMMAND
+    value: "ssh -i /secrets/deploy-key -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+```
+
+The deploy key needs read access to all repositories that will be probed.
 
 ## Running
 
 ```sh
-# With a config file and GitHub probing
-GITHUB_TOKEN=<token> go-import-redirector -config redirects.json
-
-# Config file, no GitHub probing (pure passthrough)
+# With a config file
 go-import-redirector -config redirects.json
 
-# Single mapping via positional args (original usage, no GitHub probing)
-go-import-redirector rsc.io/* https://github.com/rsc/*
+# Single mapping via positional args
+go-import-redirector rsc.io/* ssh://git@github.com/rsc/*
 ```
 
 ### Flags
@@ -70,14 +89,8 @@ go-import-redirector rsc.io/* https://github.com/rsc/*
 | `-addr` | `:http` | Address to listen on. |
 | `-vcs` | `git` | VCS type for the `go-import` tag. |
 | `-godoc-url` | | URL to redirect browsers to (non-`go-get` requests). |
-| `-github-probe-cache-ttl` | `10m` | How long to cache GitHub probe results. |
-| `-github-probe-timeout` | `5s` | Timeout per GitHub API probe. |
-
-### Environment variables
-
-| Variable | Description |
-|---|---|
-| `GITHUB_TOKEN` | GitHub personal access token or fine-grained token used to authenticate `api.github.com` probes. If unset, GitHub probing is disabled regardless of config. |
+| `-probe-cache-ttl` | `10m` | How long to cache probe results. |
+| `-probe-timeout` | `5s` | Timeout per `git ls-remote` probe. |
 
 ## Building
 
