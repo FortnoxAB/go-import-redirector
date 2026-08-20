@@ -1,4 +1,4 @@
-package githubprobe
+package gitprobe
 
 import (
 	"context"

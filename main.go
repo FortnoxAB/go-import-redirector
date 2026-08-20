@@ -72,7 +72,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fortnoxab/go-import-redirector/githubprobe"
+	"github.com/fortnoxab/go-import-redirector/gitprobe"
 )
 
 var (
@@ -95,7 +95,7 @@ type mapping struct {
 	wildcard   int
 }
 
-// repoProber is satisfied by *githubprobe.Prober; separated for test injection.
+// repoProber is satisfied by *gitprobe.Prober; separated for test injection.
 type repoProber interface {
 	Probe(ctx context.Context, repoURL string) bool
 }
@@ -118,7 +118,7 @@ func main() {
 	flag.Parse()
 	*godocURL = strings.TrimRight(*godocURL, "/")
 
-	prober = githubprobe.New(*probeCacheTTL, *probeTimeout)
+	prober = gitprobe.New(*probeCacheTTL, *probeTimeout)
 	log.Printf("git SSH probing enabled (cache TTL: %v, timeout: %v)", *probeCacheTTL, *probeTimeout)
 
 	if *config != "" {
