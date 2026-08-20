@@ -87,16 +87,14 @@ var (
 )
 
 type configEntry struct {
-	Import string `json:"import"`
-	Origin string `json:"origin"`
-	Github string `json:"github,omitempty"`
+	ImportPath string   `json:"importPath"`
+	RepoPaths  []string `json:"repoPaths"`
 }
 
 type mapping struct {
 	importPath string
-	originPath string
+	repoPaths  []string // wildcard stripped, ordered; github.com entries probed first
 	wildcard   int
-	githubOrg  string
 }
 
 // githubLooker is satisfied by *githubprobe.Prober; separated for test injection.
@@ -160,11 +158,11 @@ func main() {
 				log.Fatalf("parsing config: %v", err)
 			}
 			for _, e := range entries {
-				registerMapping(parseMapping(e.Import, e.Origin, e.Github))
+				registerMapping(parseMapping(e.ImportPath, e.RepoPaths))
 			}
 		}
 	} else if flag.NArg() == 2 {
-		registerMapping(parseMapping(flag.Arg(0), flag.Arg(1), ""))
+		registerMapping(parseMapping(flag.Arg(0), []string{flag.Arg(1)}))
 	} else {
 		log.Print("no -config or import/origin args provided; starting with no routes registered")
 	}
@@ -174,32 +172,40 @@ func main() {
 	}
 }
 
-func parseMapping(imp, origin, github string) mapping {
-	if !strings.Contains(origin, "://") {
-		log.Fatalf("origin must be a full URL: %s", origin)
+func parseMapping(imp string, repos []string) mapping {
+	if len(repos) == 0 {
+		log.Fatalf("mapping for %s has no repos", imp)
 	}
-	if strings.HasSuffix(imp, "/*") != strings.HasSuffix(origin, "/*") {
-		log.Fatalf("either both import and origin must have /* or neither: %s %s", imp, origin)
-	}
-	var githubOrg string
-	if github != "" {
-		u, err := url.Parse(strings.TrimSuffix(github, "/*"))
-		if err != nil {
-			log.Fatalf("github must be a URL like https://github.com/org/*: %s", github)
+	for _, r := range repos {
+		if !strings.Contains(r, "://") {
+			log.Fatalf("repo must be a full URL: %s", r)
 		}
-		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-		if len(parts) == 0 || parts[0] == "" {
-			log.Fatalf("github must be a URL like https://github.com/org/*: %s", github)
+		if strings.HasSuffix(imp, "/*") != strings.HasSuffix(r, "/*") {
+			log.Fatalf("import and repos must have matching /* wildcards: %s vs %s", imp, r)
 		}
-		githubOrg = parts[0]
 	}
-	m := mapping{importPath: imp, originPath: origin, githubOrg: githubOrg}
+	m := mapping{importPath: imp, repoPaths: append([]string(nil), repos...)}
 	for strings.HasSuffix(m.importPath, "/*") {
 		m.wildcard++
 		m.importPath = strings.TrimSuffix(m.importPath, "/*")
-		m.originPath = strings.TrimSuffix(m.originPath, "/*")
+		for i := range m.repoPaths {
+			m.repoPaths[i] = strings.TrimSuffix(m.repoPaths[i], "/*")
+		}
 	}
 	return m
+}
+
+// githubOrgFromRepoPath returns the GitHub org if repoPath is a github.com URL.
+func githubOrgFromRepoPath(repoPath string) (org string, isGitHub bool) {
+	u, err := url.Parse(repoPath)
+	if err != nil || u.Hostname() != "github.com" {
+		return "", false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		return "", false
+	}
+	return parts[0], true
 }
 
 func registerMapping(m mapping) {
@@ -231,7 +237,8 @@ type data struct {
 func makeHandler(m mapping) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		path := strings.TrimSuffix(req.Host+req.URL.Path, "/")
-		var importRoot, repoRoot, suffix string
+		var importRoot, suffix string
+		var elem string
 		if m.wildcard > 0 {
 			if path == m.importPath {
 				http.Redirect(w, req, *godocURL+"/"+m.importPath, http.StatusFound)
@@ -241,7 +248,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 				http.NotFound(w, req)
 				return
 			}
-			elem := path[len(m.importPath)+1:]
+			elem = path[len(m.importPath)+1:]
 			if parts := strings.Split(elem, "/"); len(parts) >= m.wildcard {
 				elem = strings.Join(parts[:m.wildcard], "/")
 				suffix = strings.Join(parts[m.wildcard:], "/")
@@ -253,29 +260,19 @@ func makeHandler(m mapping) http.HandlerFunc {
 				return
 			}
 			importRoot = m.importPath + "/" + elem
-			repoRoot = m.originPath + "/" + elem
 		} else {
 			if path != m.importPath && !strings.HasPrefix(path, m.importPath+"/") {
 				http.NotFound(w, req)
 				return
 			}
 			importRoot = m.importPath
-			repoRoot = m.originPath
 			suffix = path[len(m.importPath):]
 		}
-		vcsRoot := repoRoot
-		vcsType := *vcs
-		if githubProber != nil && m.githubOrg != "" {
-			if name := repoNameFromRoot(importRoot, m.importPath); name != "" {
-				if ghURL, ok := githubProber.Lookup(req.Context(), m.githubOrg, name); ok {
-					vcsRoot = ghURL
-					vcsType = "git"
-				}
-			}
-		}
+
+		vcsRoot := resolveRepoPath(req, m, importRoot, elem)
 		d := &data{
 			ImportRoot: importRoot,
-			VCS:        vcsType,
+			VCS:        *vcs,
 			VCSRoot:    vcsRoot,
 			Suffix:     suffix,
 			GoDocURL:   *godocURL,
@@ -287,6 +284,35 @@ func makeHandler(m mapping) http.HandlerFunc {
 		}
 		w.Write(buf.Bytes())
 	}
+}
+
+// resolveRepoPath tries each configured repoPath in order.
+// GitHub URLs are probed via the API; the first hit wins.
+// Non-GitHub URLs are served directly. The last entry is always a fallback.
+func resolveRepoPath(req *http.Request, m mapping, importRoot, elem string) string {
+	for i, rp := range m.repoPaths {
+		candidate := rp
+		if m.wildcard > 0 {
+			candidate = rp + "/" + elem
+		}
+		org, isGH := githubOrgFromRepoPath(rp)
+		isLast := i == len(m.repoPaths)-1
+		if !isGH {
+			return candidate
+		}
+		// GitHub entry: probe if possible
+		if githubProber != nil && m.wildcard > 0 {
+			if name := repoNameFromRoot(importRoot, m.importPath); name != "" {
+				if _, ok := githubProber.Lookup(req.Context(), org, name); ok {
+					return candidate
+				}
+			}
+		}
+		if isLast {
+			return candidate // last resort
+		}
+	}
+	return m.repoPaths[len(m.repoPaths)-1] // unreachable
 }
 
 func pong(w http.ResponseWriter, req *http.Request) {

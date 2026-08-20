@@ -47,45 +47,45 @@ func assertGoImport(t *testing.T, body, importRoot, vcs, vcsRoot string) {
 
 func TestHandlerProberDisabled(t *testing.T) {
 	githubProber = nil
-	m := parseMapping("go.example.com/team/*", "https://git.example.com/team/*", "https://github.com/my-org/*")
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
 	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
-	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "https://git.example.com/team/myrepo")
+	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@git.example.com/team/myrepo")
 }
 
 func TestHandlerProberHit(t *testing.T) {
-	setProber(t, map[string]string{"myrepo": "https://github.com/my-org/myrepo"})
-	m := parseMapping("go.example.com/team/*", "https://git.example.com/team/*", "https://github.com/my-org/*")
+	setProber(t, map[string]string{"myrepo": "ssh://git@github.com/my-org/myrepo"})
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
 	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
-	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "https://github.com/my-org/myrepo")
+	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@github.com/my-org/myrepo")
 }
 
 func TestHandlerProberMiss(t *testing.T) {
 	setProber(t, nil)
-	m := parseMapping("go.example.com/team/*", "https://git.example.com/team/*", "https://github.com/my-org/*")
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
 	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
-	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "https://git.example.com/team/myrepo")
+	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@git.example.com/team/myrepo")
 }
 
 func TestHandlerMajorVersionSuffix(t *testing.T) {
-	setProber(t, map[string]string{"myrepo": "https://github.com/my-org/myrepo"})
-	m := parseMapping("go.example.com/team/*", "https://git.example.com/team/*", "https://github.com/my-org/*")
+	setProber(t, map[string]string{"myrepo": "ssh://git@github.com/my-org/myrepo"})
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
 	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo/v2")
 	// importRoot must be the repo root, not include /v2
-	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "https://github.com/my-org/myrepo")
+	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@github.com/my-org/myrepo")
 }
 
 func TestHandlerNoGithubOrgSkipsProber(t *testing.T) {
-	fp := setProber(t, map[string]string{"myrepo": "https://github.com/my-org/myrepo"})
-	m := parseMapping("go.example.com/team/*", "https://git.example.com/team/*", "")
+	fp := setProber(t, map[string]string{"myrepo": "ssh://git@github.com/my-org/myrepo"})
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@git.example.com/team/*"})
 	handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	if len(fp.calls) != 0 {
-		t.Errorf("prober should not be called when githubOrg is empty; calls: %v", fp.calls)
+		t.Errorf("prober should not be called when no github.com repo; calls: %v", fp.calls)
 	}
 }
 
 func TestHandlerNonWildcardSkipsProber(t *testing.T) {
-	fp := setProber(t, map[string]string{"myrepo": "https://github.com/my-org/myrepo"})
-	m := parseMapping("go.example.com/team/myrepo", "https://git.example.com/team/myrepo", "https://github.com/my-org/myrepo")
+	fp := setProber(t, map[string]string{"myrepo": "ssh://git@github.com/my-org/myrepo"})
+	m := parseMapping("go.example.com/team/myrepo", []string{"ssh://git@github.com/my-org/myrepo", "ssh://git@git.example.com/team/myrepo"})
 	handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	if len(fp.calls) != 0 {
 		t.Errorf("prober should not be called for non-wildcard mapping; calls: %v", fp.calls)
