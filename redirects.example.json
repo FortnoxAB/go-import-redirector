@@ -1,4 +1,4 @@
 [
-  { "importPath": "vanity.example.com/team/*",  "repoPaths": ["ssh://git@github.com/my-github-org/*", "ssh://git@git.example.com/team/*"] },
+  { "importPath": "vanity.example.com/team/*",  "repoPaths": ["ssh://git@git.example.com/team/*", "ssh://git@github.com/my-github-org/*"] },
   { "importPath": "vanity.example.com/other/*", "repoPaths": ["ssh://git@git.example.com/other/*"] }
 ]

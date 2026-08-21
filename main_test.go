@@ -46,45 +46,49 @@ func assertGoImport(t *testing.T, body, importRoot, vcs, vcsRoot string) {
 
 func TestHandlerProberDisabled(t *testing.T) {
 	prober = nil
-	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@git.example.com/team/*", "ssh://git@github.com/my-org/*"})
 	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
+	// no prober → safe default: serve first (old server)
 	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@git.example.com/team/myrepo")
 }
 
 func TestHandlerProberHit(t *testing.T) {
-	setProber(t, map[string]bool{"ssh://git@github.com/my-org/myrepo": true})
-	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
-	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
-	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@github.com/my-org/myrepo")
-}
-
-func TestHandlerProberMiss(t *testing.T) {
-	setProber(t, nil)
-	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
+	// old server still has the repo → serve it
+	setProber(t, map[string]bool{"ssh://git@git.example.com/team/myrepo": true})
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@git.example.com/team/*", "ssh://git@github.com/my-org/*"})
 	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@git.example.com/team/myrepo")
 }
 
-func TestHandlerMajorVersionSuffix(t *testing.T) {
-	setProber(t, map[string]bool{"ssh://git@github.com/my-org/myrepo": true})
-	m := parseMapping("go.example.com/team/*", []string{"ssh://git@github.com/my-org/*", "ssh://git@git.example.com/team/*"})
-	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo/v2")
-	// importRoot must be the repo root, not include /v2
+func TestHandlerProberMiss(t *testing.T) {
+	// old server returns not-found → repo migrated → serve github (last entry)
+	setProber(t, nil)
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@git.example.com/team/*", "ssh://git@github.com/my-org/*"})
+	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@github.com/my-org/myrepo")
 }
 
+func TestHandlerMajorVersionSuffix(t *testing.T) {
+	// old server still has the repo
+	setProber(t, map[string]bool{"ssh://git@git.example.com/team/myrepo": true})
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@git.example.com/team/*", "ssh://git@github.com/my-org/*"})
+	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo/v2")
+	// importRoot must be the repo root, not include /v2
+	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@git.example.com/team/myrepo")
+}
+
 func TestHandlerSingleRepoSkipsProber(t *testing.T) {
-	fp := setProber(t, map[string]bool{"ssh://git@github.com/my-org/myrepo": true})
+	fp := setProber(t, map[string]bool{"ssh://git@git.example.com/team/myrepo": true})
 	m := parseMapping("go.example.com/team/*", []string{"ssh://git@git.example.com/team/*"})
 	handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	if len(fp.calls) != 0 {
-		t.Errorf("prober should not be called when no github.com repo; calls: %v", fp.calls)
+		t.Errorf("prober should not be called for single-repo mapping; calls: %v", fp.calls)
 	}
 }
 
 func TestHandlerNonWildcardSkipsProber(t *testing.T) {
-	fp := setProber(t, map[string]bool{"ssh://git@github.com/my-org/myrepo": true})
-	m := parseMapping("go.example.com/team/myrepo", []string{"ssh://git@github.com/my-org/myrepo", "ssh://git@git.example.com/team/myrepo"})
+	fp := setProber(t, map[string]bool{"ssh://git@git.example.com/team/myrepo": true})
+	m := parseMapping("go.example.com/team/myrepo", []string{"ssh://git@git.example.com/team/myrepo", "ssh://git@github.com/my-org/myrepo"})
 	handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	if len(fp.calls) != 0 {
 		t.Errorf("prober should not be called for non-wildcard mapping; calls: %v", fp.calls)

@@ -80,8 +80,10 @@ var (
 	vcs                = flag.String("vcs", "git", "set version control `system`")
 	godocURL           = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
 	config             = flag.String("config", "", "path to JSON config file (see redirects.example.json)")
-	probeCacheTTL     = flag.Duration("probe-cache-ttl", 10*time.Minute, "how long to cache git ls-remote probe results")
-	probeTimeout      = flag.Duration("probe-timeout", 5*time.Second, "timeout per git ls-remote probe")
+	probeCacheTTL       = flag.Duration("probe-cache-ttl", 10*time.Minute, "how long to cache definitive probe results")
+	probeErrorTTL       = flag.Duration("probe-error-ttl", 30*time.Second, "how long to cache ambiguous probe errors before retry")
+	probeUnreachableTTL = flag.Duration("probe-unreachable-ttl", 15*time.Minute, "assume repo migrated if old server is unreachable this long")
+	probeTimeout        = flag.Duration("probe-timeout", 5*time.Second, "timeout per git ls-remote probe")
 )
 
 type configEntry struct {
@@ -91,7 +93,7 @@ type configEntry struct {
 
 type mapping struct {
 	importPath string
-	repoPaths  []string // wildcard stripped, ordered; non-last entries are probed
+	repoPaths  []string // wildcard stripped, ordered old→new; non-last entries are probed
 	wildcard   int
 }
 
@@ -118,8 +120,9 @@ func main() {
 	flag.Parse()
 	*godocURL = strings.TrimRight(*godocURL, "/")
 
-	prober = gitprobe.New(*probeCacheTTL, *probeTimeout)
-	log.Printf("git SSH probing enabled (cache TTL: %v, timeout: %v)", *probeCacheTTL, *probeTimeout)
+	prober = gitprobe.New(*probeCacheTTL, *probeErrorTTL, *probeUnreachableTTL, *probeTimeout)
+	log.Printf("git SSH probing enabled (cache TTL: %v, error TTL: %v, unreachable TTL: %v)",
+		*probeCacheTTL, *probeErrorTTL, *probeUnreachableTTL)
 
 	if *config != "" {
 		f, err := os.Open(*config)
@@ -247,26 +250,29 @@ func makeHandler(m mapping) http.HandlerFunc {
 	}
 }
 
-// resolveRepoPath tries each configured repoPath in order.
-// Non-last entries are probed via git ls-remote; the last entry is always a fallback.
+// resolveRepoPath probes the first entries (old servers) to detect migration.
+// If an old server still has the repo → serve it. If all old servers are gone → serve last (new server).
+// Ambiguous errors default to serving the old server; persistent errors fall over to new.
 func resolveRepoPath(req *http.Request, m mapping, importRoot, elem string) string {
-	for i, rp := range m.repoPaths {
-		candidate := rp
+	candidate := func(rp string) string {
 		if m.wildcard > 0 {
-			candidate = rp + "/" + elem
+			return rp + "/" + elem
 		}
-		isLast := i == len(m.repoPaths)-1
-		if !isLast {
-			if prober != nil && m.wildcard > 0 {
-				if prober.Probe(req.Context(), candidate) {
-					return candidate
-				}
-			}
-			continue
-		}
-		return candidate
+		return rp
 	}
-	return m.repoPaths[len(m.repoPaths)-1] // unreachable
+	if len(m.repoPaths) == 1 || m.wildcard == 0 {
+		return candidate(m.repoPaths[0])
+	}
+	if prober == nil {
+		return candidate(m.repoPaths[0]) // can't probe, assume old server
+	}
+	// Probe old servers (all but last); serve last (new server) only when all are gone.
+	for i := 0; i < len(m.repoPaths)-1; i++ {
+		if prober.Probe(req.Context(), candidate(m.repoPaths[i])) {
+			return candidate(m.repoPaths[i])
+		}
+	}
+	return candidate(m.repoPaths[len(m.repoPaths)-1])
 }
 
 func pong(w http.ResponseWriter, req *http.Request) {
