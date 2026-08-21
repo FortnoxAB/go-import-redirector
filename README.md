@@ -13,16 +13,16 @@ GET https://go.example.com/team/myrepo?go-get=1
 The redirector responds with a `go-import` meta tag:
 
 ```html
-<meta name="go-import" content="go.example.com/team/myrepo git ssh://git@github.com/my-org/myrepo">
+<meta name="go-import" content="go.example.com/team/myrepo git ssh://git@git.example.com/team/myrepo">
 ```
 
 For each request the service:
 
 1. Matches the import path against the configured mappings.
-2. For each entry in `repoPaths` (in order), runs `git ls-remote <url>` to check if the repository is reachable.
-3. Returns the first reachable URL. The last entry is always served as a fallback without probing.
+2. Probes each `repoPaths` entry **except the last** (the old/primary servers) via `git ls-remote` to check whether the repo is still there.
+3. Serves the first old server that still has the repo. Once all old servers return "not found", the last entry (the new server / migration target) is served automatically.
 
-Probe results are cached for `-probe-cache-ttl` (default 10 minutes), so `go mod download` over a large dependency graph does not fan out into repeated SSH calls.
+Probe results are cached (`-probe-cache-ttl`, default 10 minutes). Ambiguous errors (network outage, auth failure) are retried after a shorter interval (`-probe-error-ttl`, default 30 seconds) and default to serving the old server — so a transient outage never wrongly migrates traffic. If an old server has been unreachable for longer than `-probe-unreachable-ttl` (default 15 minutes), it is treated as gone and the new server is served instead.
 
 ## Configuration
 
@@ -31,8 +31,8 @@ Copy `redirects.example.json` to `redirects.json` (which is git-ignored) and fil
 ```json
 [
   { "importPath": "go.example.com/team/*", "repoPaths": [
-      "ssh://git@github.com/my-org/*",
-      "ssh://git@git.example.com/team/*"
+      "ssh://git@git.example.com/team/*",
+      "ssh://git@github.com/my-org/*"
   ]},
   { "importPath": "go.example.com/other/*", "repoPaths": [
       "ssh://git@git.example.com/other/*"
@@ -43,7 +43,7 @@ Copy `redirects.example.json` to `redirects.json` (which is git-ignored) and fil
 | Field | Required | Description |
 |---|---|---|
 | `importPath` | yes | Vanity import path prefix. Supports `/*` wildcard. |
-| `repoPaths` | yes | Ordered list of candidate VCS URLs. Each must be a full URL and use the same wildcard pattern as `importPath`. The first reachable entry wins; the last is always the fallback. |
+| `repoPaths` | yes | Ordered list of VCS URLs, **old server first, new server last**. The old servers are probed; when a repo is gone from all of them the last entry (new server) is served automatically. No config change is needed as individual repos migrate. |
 
 A request for `go.example.com/team/myrepo/v2` produces `importRoot = go.example.com/team/myrepo` regardless of major version suffix.
 
@@ -89,7 +89,9 @@ go-import-redirector rsc.io/* ssh://git@github.com/rsc/*
 | `-addr` | `:http` | Address to listen on. |
 | `-vcs` | `git` | VCS type for the `go-import` tag. |
 | `-godoc-url` | | URL to redirect browsers to (non-`go-get` requests). |
-| `-probe-cache-ttl` | `10m` | How long to cache probe results. |
+| `-probe-cache-ttl` | `10m` | How long to cache definitive probe results (repo found or cleanly not found). |
+| `-probe-error-ttl` | `30s` | How long to cache ambiguous errors (network, auth) before retry. |
+| `-probe-unreachable-ttl` | `15m` | Treat an old server as gone if it has been unreachable this long. |
 | `-probe-timeout` | `5s` | Timeout per `git ls-remote` probe. |
 
 ## Building

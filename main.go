@@ -2,61 +2,22 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Go-import-redirector is an HTTP server for a custom Go import domain.
-// It responds to requests in a given import path root with a meta tag
-// specifying the source repository for the ``go get'' command and an
-// HTML redirect to the godoc.org documentation page for that package.
+// Go-import-redirector is an HTTP server for custom Go vanity import paths.
+// It probes old VCS servers (e.g. Bitbucket) via git ls-remote and automatically
+// falls over to new servers (e.g. GitHub) once a repo is no longer found on the old server.
+// No config change is needed as individual repos migrate.
 //
 // Usage:
 //
-//	go-import-redirector [-addr address] [-tls] [-vcs sys] <import> <repo>
+//	go-import-redirector [-config file] [<import> <repo>]
 //
-// Go-import-redirector listens on address (default ``:80'')
-// and responds to requests for URLs in the given import path root
-// with one meta tag specifying the given source repository for ``go get''
-// and another meta tag causing a redirect to the corresponding
-// godoc.org documentation page.
+// Configuration is typically supplied via a JSON file (see -config flag and
+// redirects.example.json). Alternatively, a single mapping can be given on
+// the command line:
 //
-// For example, if invoked as:
+//	go-import-redirector go.example.com/* ssh://git@git.example.com/*
 //
-//	go-import-redirector 9fans.net/go https://github.com/9fans/go
-//
-// then the response for 9fans.net/go/acme/editinacme will include these tags:
-//
-//	<meta name="go-import" content="9fans.net/go git https://github.com/9fans/go">
-//	<meta http-equiv="refresh" content="0; url=https://godoc.org/9fans.net/go/acme/editinacme">
-//
-// If both <import> and <repo> end in /*, the corresponding path element
-// is taken from the import path and substituted in repo on each request.
-// For example, if invoked as:
-//
-//	go-import-redirector rsc.io/* https://github.com/rsc/*
-//
-// then the response for rsc.io/x86/x86asm will include these tags:
-//
-//	<meta name="go-import" content="rsc.io/x86 git https://github.com/rsc/x86">
-//	<meta http-equiv="refresh" content="0; url=https://godoc.org/rsc.io/x86/x86asm">
-//
-// Note that the wildcard element (x86) has been included in the Git repo path.
-//
-// The -addr option specifies the HTTP address to serve (default ``:http'').
-//
-// The -tls option causes go-import-redirector to serve HTTPS on port 443,
-// loading an X.509 certificate and key pair from files in the current directory
-// named after the host in the import path with .crt and .key appended
-// (for example, rsc.io.crt and rsc.io.key).
-// Like for http.ListenAndServeTLS, the certificate file should contain the
-// concatenation of the server's certificate and the signing certificate authority's certificate.
-//
-// The -vcs option specifies the version control system, git, hg, or svn (default ``git'').
-//
-// Deployment on Google Cloud Platform
-//
-// For the case of a redirector for an entire domain (such as rsc.io above),
-// the Makefile in this directory contains recipes to deploy a trivial VM running
-// just this program, using a static IP address that can be loaded into the
-// DNS configuration for the target domain.
-//
+// See the README for full documentation of flags and config format.
 package main
 
 import (
