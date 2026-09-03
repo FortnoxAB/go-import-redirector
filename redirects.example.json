@@ -1,4 +1,8 @@
 [
-  { "importPath": "vanity.example.com/team/*",  "repoPaths": ["ssh://git@git.example.com/team/*", "ssh://git@github.com/my-github-org/*"] },
-  { "importPath": "vanity.example.com/other/*", "repoPaths": ["ssh://git@git.example.com/other/*"] }
+  { "importPath": "vanity.example.com/project1/*",  "repoPaths": ["ssh://git@github.com/organisation1/go-*", "ssh://git@git.example.com/project1/*"] },
+  { "importPath": "vanity.example.com/project2/*",  "repoPaths": ["ssh://git@github.com/organisation2/*", "ssh://git@git.example.com/project2/*"] },
+  { "importPath": "vanity.example.com/project3/*", "repoPaths": ["ssh://git@github.com/organisation3/*", "ssh://git@git.example.com/project3/*"] }
 ]
+
+
+

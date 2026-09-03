@@ -54,7 +54,7 @@ type configEntry struct {
 
 type mapping struct {
 	importPath string
-	repoPaths  []string // wildcard stripped, ordered old→new; non-last entries are probed
+	repoPaths  []string // "*" placeholder substituted with matched elem when wildcard>0; ordered old→new; non-last entries are probed
 	wildcard   int
 }
 
@@ -114,11 +114,14 @@ func parseMapping(imp string, repos []string) mapping {
 	if len(repos) == 0 {
 		log.Fatalf("mapping for %s has no repos", imp)
 	}
+	isWildcard := strings.HasSuffix(imp, "/*")
 	for _, r := range repos {
 		if !strings.Contains(r, "://") {
 			log.Fatalf("repo must be a full URL: %s", r)
 		}
-		if strings.HasSuffix(imp, "/*") != strings.HasSuffix(r, "/*") {
+		// repoPaths use a literal "*" placeholder (optionally with a static suffix/prefix
+		// in the same segment, e.g. "*-go-lib", to rename a repo during migration).
+		if isWildcard != strings.Contains(r, "*") {
 			log.Fatalf("import and repos must have matching /* wildcards: %s vs %s", imp, r)
 		}
 	}
@@ -126,9 +129,6 @@ func parseMapping(imp string, repos []string) mapping {
 	for strings.HasSuffix(m.importPath, "/*") {
 		m.wildcard++
 		m.importPath = strings.TrimSuffix(m.importPath, "/*")
-		for i := range m.repoPaths {
-			m.repoPaths[i] = strings.TrimSuffix(m.repoPaths[i], "/*")
-		}
 	}
 	return m
 }
@@ -217,11 +217,11 @@ func makeHandler(m mapping) http.HandlerFunc {
 func resolveRepoPath(req *http.Request, m mapping, importRoot, elem string) string {
 	candidate := func(rp string) string {
 		if m.wildcard > 0 {
-			return rp + "/" + elem
+			return strings.Replace(rp, "*", elem, 1)
 		}
 		return rp
 	}
-	if len(m.repoPaths) == 1 || m.wildcard == 0 {
+	if len(m.repoPaths) == 1 {
 		return candidate(m.repoPaths[0])
 	}
 	if prober == nil {

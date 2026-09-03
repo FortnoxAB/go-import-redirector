@@ -86,12 +86,40 @@ func TestHandlerSingleRepoSkipsProber(t *testing.T) {
 	}
 }
 
-func TestHandlerNonWildcardSkipsProber(t *testing.T) {
+func TestHandlerNonWildcardSingleRepoSkipsProber(t *testing.T) {
 	fp := setProber(t, map[string]bool{"ssh://git@git.example.com/team/myrepo": true})
-	m := parseMapping("go.example.com/team/myrepo", []string{"ssh://git@git.example.com/team/myrepo", "ssh://git@github.com/my-org/myrepo"})
+	m := parseMapping("go.example.com/team/myrepo", []string{"ssh://git@git.example.com/team/myrepo"})
 	handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
 	if len(fp.calls) != 0 {
-		t.Errorf("prober should not be called for non-wildcard mapping; calls: %v", fp.calls)
+		t.Errorf("prober should not be called for single-repo mapping; calls: %v", fp.calls)
 	}
+}
+
+func TestHandlerNonWildcardRenameProbed(t *testing.T) {
+	// override entry renaming the repo on migration; still probed like a wildcard mapping
+	setProber(t, nil)
+	m := parseMapping("go.example.com/team/users", []string{"ssh://git@git.example.com/team/users", "ssh://git@github.com/my-org/users-go-lib"})
+	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/users")
+	assertGoImport(t, body, "go.example.com/team/users", "git", "ssh://git@github.com/my-org/users-go-lib")
+}
+
+func TestHandlerWildcardSuffixFallback(t *testing.T) {
+	// project-wide mapping: check the renamed (suffixed) repo first, fall back to the plain name
+	// for repos that weren't renamed (e.g. no name collision on the new server).
+	m := parseMapping("go.example.com/team/*", []string{
+		"ssh://git@git.example.com/team/*",
+		"ssh://git@github.com/my-org/go-*",
+		"ssh://git@github.com/my-org/*",
+	})
+
+	// "users" collided and was renamed → found under the suffixed name.
+	setProber(t, map[string]bool{"ssh://git@github.com/my-org/users-go-lib": true})
+	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/users")
+	assertGoImport(t, body, "go.example.com/team/users", "git", "ssh://git@github.com/my-org/users-go-lib")
+
+	// "sune" has no collision and kept its plain name → suffixed miss, plain-name fallback.
+	setProber(t, map[string]bool{"ssh://git@github.com/my-org/sune": true})
+	body = handlerResponse(t, makeHandler(m), "go.example.com", "/team/sune")
+	assertGoImport(t, body, "go.example.com/team/sune", "git", "ssh://git@github.com/my-org/sune")
 }
 
