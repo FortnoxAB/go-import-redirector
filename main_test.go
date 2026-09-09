@@ -108,7 +108,7 @@ func TestHandlerWildcardSuffixFallback(t *testing.T) {
 	// for repos that weren't renamed (e.g. no name collision on the new server).
 	m := parseMapping("go.example.com/team/*", []string{
 		"ssh://git@git.example.com/team/*",
-		"ssh://git@github.com/my-org/go-*",
+		"ssh://git@github.com/my-org/*-go-lib",
 		"ssh://git@github.com/my-org/*",
 	})
 

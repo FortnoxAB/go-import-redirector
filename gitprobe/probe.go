@@ -105,5 +105,6 @@ func isDefinitivelyGone(stderr string) bool {
 	s := strings.ToLower(stderr)
 	return strings.Contains(s, "repository not found") ||
 		strings.Contains(s, "does not appear to be a git repository") ||
-		strings.Contains(s, "not found")
+		strings.Contains(s, "remote: not found") ||
+		(strings.Contains(s, "fatal: repository") && strings.Contains(s, "not found"))
 }

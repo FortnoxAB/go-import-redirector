@@ -51,7 +51,7 @@ A request for `go.example.com/team/myrepo/v2` produces `importRoot = go.example.
 
 ### Renaming repos during migration
 
-In a wildcard `repoPaths` entry, `*` is a literal placeholder for the matched repo name and can have a static prefix/suffix in the same segment, e.g. `*-go-lib`. Combined with probing, this lets a whole project fall back through several naming conventions — handy when a repo must be renamed on the new server to avoid a name clash with something that already exists there:
+In a wildcard `repoPaths` entry, `*` is a literal placeholder for the matched repo name and can have a static prefix/suffix in the same segment, e.g. `*-go-lib` or `go-*`. Combined with probing, this lets a whole project fall back through several naming conventions — handy when a repo must be renamed on the new server to avoid a name clash with something that already exists there:
 
 ```json
 { "importPath": "go.example.com/team/*", "repoPaths": [

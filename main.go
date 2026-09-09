@@ -120,7 +120,7 @@ func parseMapping(imp string, repos []string) mapping {
 			log.Fatalf("repo must be a full URL: %s", r)
 		}
 		// repoPaths use a literal "*" placeholder (optionally with a static suffix/prefix
-		// in the same segment, e.g. "*-go-lib", to rename a repo during migration).
+		// in the same segment, e.g. "*-go-lib" or "go-*", to rename a repo during migration).
 		if isWildcard != strings.Contains(r, "*") {
 			log.Fatalf("import and repos must have matching /* wildcards: %s vs %s", imp, r)
 		}
@@ -161,11 +161,19 @@ type data struct {
 
 func makeHandler(m mapping) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		path := strings.TrimSuffix(req.Host+req.URL.Path, "/")
+		host := req.Host
+		if i := strings.LastIndex(host, ":"); i != -1 && !strings.Contains(host, "]") {
+			host = host[:i] // strip port; import paths never include one
+		}
+		path := strings.TrimSuffix(host+req.URL.Path, "/")
 		var importRoot, suffix string
 		var elem string
 		if m.wildcard > 0 {
 			if path == m.importPath {
+				if *godocURL == "" {
+					http.NotFound(w, req)
+					return
+				}
 				http.Redirect(w, req, *godocURL+"/"+m.importPath, http.StatusFound)
 				return
 			}
@@ -194,7 +202,16 @@ func makeHandler(m mapping) http.HandlerFunc {
 			suffix = path[len(m.importPath):]
 		}
 
-		vcsRoot := resolveRepoPath(req, m, importRoot, elem)
+		if req.URL.Query().Get("go-get") != "1" {
+			if *godocURL == "" {
+				http.NotFound(w, req)
+				return
+			}
+			http.Redirect(w, req, *godocURL+"/"+importRoot+suffix, http.StatusFound)
+			return
+		}
+
+		vcsRoot := resolveRepoPath(req, m, elem)
 		d := &data{
 			ImportRoot: importRoot,
 			VCS:        *vcs,
@@ -214,7 +231,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 // resolveRepoPath probes the first entries (old servers) to detect migration.
 // If an old server still has the repo → serve it. If all old servers are gone → serve last (new server).
 // Ambiguous errors default to serving the old server; persistent errors fall over to new.
-func resolveRepoPath(req *http.Request, m mapping, importRoot, elem string) string {
+func resolveRepoPath(req *http.Request, m mapping, elem string) string {
 	candidate := func(rp string) string {
 		if m.wildcard > 0 {
 			return strings.Replace(rp, "*", elem, 1)
