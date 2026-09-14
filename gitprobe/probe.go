@@ -22,6 +22,10 @@ type cacheEntry struct {
 // wildcard names cannot grow the map without limit.
 const maxCacheEntries = 10000
 
+// maxConcurrentProbes bounds how many git subprocesses can run at once, so
+// requests for many distinct wildcard names can't exhaust process/CPU/memory.
+const maxConcurrentProbes = 32
+
 // Prober checks git repo existence via git ls-remote and caches results.
 // A definitive "not found" and a repo that has been unreachable longer than
 // unreachableTTL are both treated as gone. Ambiguous errors (network, auth)
@@ -34,6 +38,7 @@ type Prober struct {
 	mu             sync.Mutex
 	cache          map[string]cacheEntry
 	inflight       map[string]*probeCall // serializes concurrent probes of the same URL
+	sem            chan struct{}         // bounds concurrent git subprocesses across all URLs
 }
 
 // probeCall lets concurrent callers for the same URL share one in-flight
@@ -52,6 +57,7 @@ func New(ttl, errorTTL, unreachableTTL, timeout time.Duration) *Prober {
 		unreachableTTL: unreachableTTL,
 		timeout:        timeout,
 		cache:          make(map[string]cacheEntry),
+		sem:            make(chan struct{}, maxConcurrentProbes),
 	}
 }
 
@@ -91,6 +97,21 @@ func (p *Prober) Probe(ctx context.Context, repoURL string) bool {
 }
 
 func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince time.Time) bool {
+	select {
+	case p.sem <- struct{}{}:
+		defer func() { <-p.sem }()
+	case <-ctx.Done():
+		// Caller gave up waiting for a free probe slot; says nothing about
+		// the repo, so don't touch the cache or outage tracking.
+		p.mu.Lock()
+		e, ok := p.cache[repoURL]
+		p.mu.Unlock()
+		if ok {
+			return e.exists
+		}
+		return true
+	}
+
 	timeoutCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
