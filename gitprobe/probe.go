@@ -3,7 +3,9 @@ package gitprobe
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log"
+	"net/url"
 	"os/exec"
 	"strings"
 	"sync"
@@ -31,6 +33,14 @@ type Prober struct {
 	timeout        time.Duration
 	mu             sync.Mutex
 	cache          map[string]cacheEntry
+	inflight       map[string]*probeCall // serializes concurrent probes of the same URL
+}
+
+// probeCall lets concurrent callers for the same URL share one in-flight
+// probe instead of racing to write the cache entry out of order.
+type probeCall struct {
+	done   chan struct{}
+	result bool
 }
 
 // New returns a Prober. errorTTL controls retry interval on ambiguous errors;
@@ -50,21 +60,42 @@ func New(ttl, errorTTL, unreachableTTL, timeout time.Duration) *Prober {
 func (p *Prober) Probe(ctx context.Context, repoURL string) bool {
 	p.mu.Lock()
 	e, ok := p.cache[repoURL]
-	unreachableSince := e.unreachableSince
 	if ok && time.Now().Before(e.expires) {
 		p.mu.Unlock()
 		return e.exists
 	}
+	// Join an in-flight probe for the same URL instead of racing it: two
+	// concurrent probes can finish out of order and the slower one would
+	// otherwise overwrite a fresher cache entry.
+	if c, inflight := p.inflight[repoURL]; inflight {
+		p.mu.Unlock()
+		<-c.done
+		return c.result
+	}
+	c := &probeCall{done: make(chan struct{})}
+	if p.inflight == nil {
+		p.inflight = make(map[string]*probeCall)
+	}
+	p.inflight[repoURL] = c
+	unreachableSince := e.unreachableSince
 	p.mu.Unlock()
-	return p.probe(ctx, repoURL, unreachableSince)
+
+	result := p.probe(ctx, repoURL, unreachableSince)
+
+	p.mu.Lock()
+	delete(p.inflight, repoURL)
+	p.mu.Unlock()
+	c.result = result
+	close(c.done)
+	return result
 }
 
 func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince time.Time) bool {
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	timeoutCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "git", "ls-remote", repoURL)
+	cmd := exec.CommandContext(timeoutCtx, "git", "ls-remote", repoURL)
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 
@@ -79,7 +110,7 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 
 	// Definitively gone: repo not found (not a transient error)
 	if isDefinitivelyGone(stderr.String()) {
-		log.Printf("gitprobe: %s: not found", repoURL)
+		log.Printf("gitprobe: %s: not found", redactForLog(repoURL))
 		p.mu.Lock()
 		p.cache[repoURL] = cacheEntry{exists: false, expires: now.Add(p.ttl)}
 		p.evictLocked(now)
@@ -87,23 +118,44 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 		return false
 	}
 
+	// The caller (HTTP request) was canceled/disconnected before our own
+	// timeout elapsed; that says nothing about the repo, so leave the cache
+	// and outage tracking untouched and fall back to the last known result.
+	if errors.Is(timeoutCtx.Err(), context.Canceled) {
+		p.mu.Lock()
+		e, ok := p.cache[repoURL]
+		p.mu.Unlock()
+		if ok {
+			return e.exists
+		}
+		return true
+	}
+
 	// Ambiguous error (network, auth, timeout): safe default is "still exists"
 	// unless we've been failing continuously longer than unreachableTTL.
-	if ctx.Err() == nil {
-		log.Printf("gitprobe: %s: %v", repoURL, err)
-	}
+	log.Printf("gitprobe: %s: %v", redactForLog(repoURL), err)
 	if unreachableSince.IsZero() {
 		unreachableSince = now
 	}
 	assumeGone := now.Sub(unreachableSince) >= p.unreachableTTL
 	if assumeGone {
-		log.Printf("gitprobe: %s unreachable since %s, assuming migrated", repoURL, unreachableSince.Format(time.RFC3339))
+		log.Printf("gitprobe: %s unreachable since %s, assuming migrated", redactForLog(repoURL), unreachableSince.Format(time.RFC3339))
 	}
 	p.mu.Lock()
 	p.cache[repoURL] = cacheEntry{exists: !assumeGone, expires: now.Add(p.errorTTL), unreachableSince: unreachableSince}
 	p.evictLocked(now)
 	p.mu.Unlock()
 	return !assumeGone
+}
+
+// redactForLog strips credentials from a repo URL's userinfo before logging.
+func redactForLog(repoURL string) string {
+	u, err := url.Parse(repoURL)
+	if err != nil || u.User == nil {
+		return repoURL
+	}
+	u.User = url.User("redacted")
+	return u.String()
 }
 
 // evictLocked removes entries that no longer need tracking, then—if the

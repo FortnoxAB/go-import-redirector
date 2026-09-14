@@ -241,8 +241,8 @@ func resolveRepoPath(req *http.Request, m mapping, elem string) string {
 	if len(m.repoPaths) == 1 {
 		return candidate(m.repoPaths[0])
 	}
-	if prober == nil {
-		return candidate(m.repoPaths[0]) // can't probe, assume old server
+	if prober == nil || *vcs != "git" {
+		return candidate(m.repoPaths[0]) // can't probe non-git VCS with git ls-remote, assume old server
 	}
 	// Probe old servers (all but last); serve last (new server) only when all are gone.
 	for i := 0; i < len(m.repoPaths)-1; i++ {

@@ -95,6 +95,19 @@ func TestHandlerNonWildcardSingleRepoSkipsProber(t *testing.T) {
 	}
 }
 
+func TestHandlerNonGitVCSSkipsProber(t *testing.T) {
+	fp := setProber(t, map[string]bool{"ssh://hg@hg.example.com/team/myrepo": true})
+	orig := *vcs
+	*vcs = "hg"
+	t.Cleanup(func() { *vcs = orig })
+	m := parseMapping("go.example.com/team/*", []string{"ssh://hg@hg.example.com/team/*", "ssh://hg@github.com/my-org/*"})
+	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
+	if len(fp.calls) != 0 {
+		t.Errorf("git ls-remote prober must not run against a non-git VCS; calls: %v", fp.calls)
+	}
+	assertGoImport(t, body, "go.example.com/team/myrepo", "hg", "ssh://hg@hg.example.com/team/myrepo")
+}
+
 func TestHandlerNonWildcardRenameProbed(t *testing.T) {
 	// override entry renaming the repo on migration; still probed like a wildcard mapping
 	setProber(t, nil)
