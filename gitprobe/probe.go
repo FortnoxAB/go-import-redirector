@@ -73,10 +73,14 @@ func (p *Prober) Probe(ctx context.Context, repoURL string) bool {
 	// Join an in-flight probe for the same URL instead of racing it: two
 	// concurrent probes can finish out of order and the slower one would
 	// otherwise overwrite a fresher cache entry.
-	if c, inflight := p.inflight[repoURL]; inflight {
+if c, inflight := p.inflight[repoURL]; inflight {
 		p.mu.Unlock()
-		<-c.done
-		return c.result
+		select {
+		case <-c.done:
+			return c.result
+		case <-ctx.Done():
+			return true
+		}
 	}
 	c := &probeCall{done: make(chan struct{})}
 	if p.inflight == nil {
