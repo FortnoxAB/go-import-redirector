@@ -2,90 +2,81 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Go-import-redirector is an HTTP server for a custom Go import domain.
-// It responds to requests in a given import path root with a meta tag
-// specifying the source repository for the ``go get'' command and an
-// HTML redirect to the godoc.org documentation page for that package.
+// Go-import-redirector is an HTTP server for custom Go vanity import paths.
+// It probes old VCS servers (e.g. Bitbucket) via git ls-remote and automatically
+// falls over to new servers (e.g. GitHub) once a repo is no longer found on the old server.
+// No config change is needed as individual repos migrate.
 //
 // Usage:
 //
-//	go-import-redirector [-addr address] [-tls] [-vcs sys] <import> <repo>
+//	go-import-redirector [-config file] [<import> <repo>]
 //
-// Go-import-redirector listens on address (default ``:80'')
-// and responds to requests for URLs in the given import path root
-// with one meta tag specifying the given source repository for ``go get''
-// and another meta tag causing a redirect to the corresponding
-// godoc.org documentation page.
+// Configuration is typically supplied via a JSON file (see -config flag and
+// redirects.example.json). Alternatively, a single mapping can be given on
+// the command line:
 //
-// For example, if invoked as:
+//	go-import-redirector go.example.com/* ssh://git@git.example.com/*
 //
-//	go-import-redirector 9fans.net/go https://github.com/9fans/go
-//
-// then the response for 9fans.net/go/acme/editinacme will include these tags:
-//
-//	<meta name="go-import" content="9fans.net/go git https://github.com/9fans/go">
-//	<meta http-equiv="refresh" content="0; url=https://godoc.org/9fans.net/go/acme/editinacme">
-//
-// If both <import> and <repo> end in /*, the corresponding path element
-// is taken from the import path and substituted in repo on each request.
-// For example, if invoked as:
-//
-//	go-import-redirector rsc.io/* https://github.com/rsc/*
-//
-// then the response for rsc.io/x86/x86asm will include these tags:
-//
-//	<meta name="go-import" content="rsc.io/x86 git https://github.com/rsc/x86">
-//	<meta http-equiv="refresh" content="0; url=https://godoc.org/rsc.io/x86/x86asm">
-//
-// Note that the wildcard element (x86) has been included in the Git repo path.
-//
-// The -addr option specifies the HTTP address to serve (default ``:http'').
-//
-// The -tls option causes go-import-redirector to serve HTTPS on port 443,
-// loading an X.509 certificate and key pair from files in the current directory
-// named after the host in the import path with .crt and .key appended
-// (for example, rsc.io.crt and rsc.io.key).
-// Like for http.ListenAndServeTLS, the certificate file should contain the
-// concatenation of the server's certificate and the signing certificate authority's certificate.
-//
-// The -vcs option specifies the version control system, git, hg, or svn (default ``git'').
-//
-// Deployment on Google Cloud Platform
-//
-// For the case of a redirector for an entire domain (such as rsc.io above),
-// the Makefile in this directory contains recipes to deploy a trivial VM running
-// just this program, using a static IP address that can be loaded into the
-// DNS configuration for the target domain.
-//
+// See the README for full documentation of flags and config format.
 package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"time"
+
+	"github.com/fortnoxab/go-import-redirector/gitprobe"
 )
 
 var (
-	addr       = flag.String("addr", ":http", "serve http on `address`")
-	vcs        = flag.String("vcs", "git", "set version control `system`")
-	godocURL   = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
-	importPath string
-	repoPath   string
-	wildcard   int
+	addr                = flag.String("addr", ":http", "serve http on `address`")
+	vcs                 = flag.String("vcs", "git", "set version control `system`")
+	godocURL            = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
+	config              = flag.String("config", "", "path to JSON config file (see redirects.example.json)")
+	probeCacheTTL       = flag.Duration("probe-cache-ttl", 10*time.Minute, "how long to cache definitive probe results")
+	probeErrorTTL       = flag.Duration("probe-error-ttl", 30*time.Second, "how long to cache ambiguous probe errors before retry")
+	probeUnreachableTTL = flag.Duration("probe-unreachable-ttl", 15*time.Minute, "assume repo migrated if old server is unreachable this long")
+	probeTimeout        = flag.Duration("probe-timeout", 5*time.Second, "timeout per git ls-remote probe")
 )
 
+type configEntry struct {
+	ImportPath string   `json:"importPath"`
+	RepoPaths  []string `json:"repoPaths"`
+}
+
+type mapping struct {
+	importPath string
+	repoPaths  []string // "*" placeholder substituted with matched elem when wildcard>0; ordered old→new; non-last entries are probed
+	wildcard   int
+}
+
+// repoProber is satisfied by *gitprobe.Prober; separated for test injection.
+type repoProber interface {
+	Probe(ctx context.Context, repoURL string) bool
+}
+
+var prober repoProber
+
+// registeredImportPaths guards against registering the same HTTP pattern
+// twice, which would otherwise panic inside http.HandleFunc.
+var registeredImportPaths = map[string]bool{}
+
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: go-import-redirector <import> <repo>\n")
+	fmt.Fprintf(os.Stderr, "usage: go-import-redirector [-config file] [<import> <origin>]\n")
 	fmt.Fprintf(os.Stderr, "options:\n")
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, "examples:\n")
+	fmt.Fprintf(os.Stderr, "\tgo-import-redirector -config redirects.json\n")
 	fmt.Fprintf(os.Stderr, "\tgo-import-redirector rsc.io/* https://github.com/rsc/*\n")
-	fmt.Fprintf(os.Stderr, "\tgo-import-redirector 9fans.net/go https://github.com/9fans/go\n")
 	os.Exit(2)
 }
 
@@ -93,31 +84,73 @@ func main() {
 	log.SetPrefix("go-import-redirector: ")
 	flag.Usage = usage
 	flag.Parse()
-	if flag.NArg() != 2 {
-		flag.Usage()
-	}
-	importPath = flag.Arg(0)
-	repoPath = flag.Arg(1)
-	if !strings.Contains(repoPath, "://") {
-		log.Fatal("repo path must be full URL")
-	}
-	if strings.HasSuffix(importPath, "/*") != strings.HasSuffix(repoPath, "/*") {
-		log.Fatal("either both import and repo must have /* or neither")
-	}
-	for strings.HasSuffix(importPath, "/*") {
-		wildcard++
-		importPath = strings.TrimSuffix(importPath, "/*")
-		repoPath = strings.TrimSuffix(repoPath, "/*")
-	}
-
 	*godocURL = strings.TrimRight(*godocURL, "/")
 
-	http.HandleFunc(strings.TrimSuffix(importPath, "/")+"/", redirect)
-	http.HandleFunc(importPath+"/.ping", pong) // non-redirecting URL for debugging TLS certificates
-	err := http.ListenAndServe(*addr, nil)
-	if err != nil {
+	prober = gitprobe.New(*probeCacheTTL, *probeErrorTTL, *probeUnreachableTTL, *probeTimeout)
+	log.Printf("git SSH probing enabled (cache TTL: %v, error TTL: %v, unreachable TTL: %v)",
+		*probeCacheTTL, *probeErrorTTL, *probeUnreachableTTL)
+
+	if *config != "" {
+		f, err := os.Open(*config)
+		if err != nil {
+			log.Fatalf("cannot open config %s: %v", *config, err)
+		} else {
+			defer f.Close()
+			var entries []configEntry
+			if err := json.NewDecoder(f).Decode(&entries); err != nil {
+				log.Fatalf("parsing config: %v", err)
+			}
+			for _, e := range entries {
+				registerMapping(parseMapping(e.ImportPath, e.RepoPaths))
+			}
+		}
+	} else if flag.NArg() == 2 {
+		registerMapping(parseMapping(flag.Arg(0), []string{flag.Arg(1)}))
+	} else {
+		usage()
+	}
+
+	if err := http.ListenAndServe(*addr, nil); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func parseMapping(imp string, repos []string) mapping {
+	if len(repos) == 0 {
+		log.Fatalf("mapping for %s has no repos", imp)
+	}
+	isWildcard := strings.HasSuffix(imp, "/*")
+	for _, r := range repos {
+		if !strings.Contains(r, "://") {
+			log.Fatalf("repo must be a full URL: %s", r)
+		}
+		// repoPaths use a literal "*" placeholder (optionally with a static suffix/prefix
+		// in the same segment, e.g. "*-go-lib" or "go-*", to rename a repo during migration).
+		// Exactly one "*" is required: candidate() only substitutes the first
+		// occurrence, so a second "*" would silently survive into the VCS URL.
+		count := strings.Count(r, "*")
+		if isWildcard && count != 1 {
+			log.Fatalf("repo must contain exactly one \"*\" placeholder: %s", r)
+		}
+		if !isWildcard && count != 0 {
+			log.Fatalf("import and repos must have matching /* wildcards: %s vs %s", imp, r)
+		}
+	}
+	m := mapping{importPath: imp, repoPaths: append([]string(nil), repos...)}
+	for strings.HasSuffix(m.importPath, "/*") {
+		m.wildcard++
+		m.importPath = strings.TrimSuffix(m.importPath, "/*")
+	}
+	return m
+}
+
+func registerMapping(m mapping) {
+	if registeredImportPaths[m.importPath] {
+		log.Fatalf("duplicate importPath in config: %s", m.importPath)
+	}
+	registeredImportPaths[m.importPath] = true
+	http.HandleFunc(strings.TrimSuffix(m.importPath, "/")+"/", makeHandler(m))
+	http.HandleFunc(m.importPath+"/.ping", pong)
 }
 
 var tmpl = template.Must(template.New("main").Parse(`<!DOCTYPE html>
@@ -141,54 +174,98 @@ type data struct {
 	GoDocURL   string
 }
 
-func redirect(w http.ResponseWriter, req *http.Request) {
-	path := strings.TrimSuffix(req.Host+req.URL.Path, "/")
-	var importRoot, repoRoot, suffix string
-	if wildcard > 0 {
-		if path == importPath {
-			http.Redirect(w, req, *godocURL+"/"+importPath, http.StatusFound)
-			return
+func makeHandler(m mapping) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		host := req.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h // strip port (including bracketed IPv6); import paths never include one
 		}
-		if !strings.HasPrefix(path, importPath+"/") {
-			http.NotFound(w, req)
-			return
-		}
-		elem := path[len(importPath)+1:]
-		if parts := strings.Split(elem, "/"); len(parts) >= wildcard {
-			elem = strings.Join(parts[:wildcard], "/")
-			suffix = strings.Join(parts[wildcard:], "/")
-			if suffix != "" {
-				suffix = "/" + suffix
+		path := strings.TrimSuffix(host+req.URL.Path, "/")
+		var importRoot, suffix string
+		var elem string
+		if m.wildcard > 0 {
+			if path == m.importPath {
+				if *godocURL == "" {
+					http.NotFound(w, req)
+					return
+				}
+				http.Redirect(w, req, *godocURL+"/"+m.importPath, http.StatusFound)
+				return
 			}
+			if !strings.HasPrefix(path, m.importPath+"/") {
+				http.NotFound(w, req)
+				return
+			}
+			elem = path[len(m.importPath)+1:]
+			if parts := strings.Split(elem, "/"); len(parts) >= m.wildcard {
+				elem = strings.Join(parts[:m.wildcard], "/")
+				suffix = strings.Join(parts[m.wildcard:], "/")
+				if suffix != "" {
+					suffix = "/" + suffix
+				}
+			} else {
+				http.NotFound(w, req)
+				return
+			}
+			importRoot = m.importPath + "/" + elem
 		} else {
-			http.NotFound(w, req)
+			if path != m.importPath && !strings.HasPrefix(path, m.importPath+"/") {
+				http.NotFound(w, req)
+				return
+			}
+			importRoot = m.importPath
+			suffix = path[len(m.importPath):]
+		}
+
+		if req.URL.Query().Get("go-get") != "1" {
+			if *godocURL == "" {
+				http.NotFound(w, req)
+				return
+			}
+			http.Redirect(w, req, *godocURL+"/"+importRoot+suffix, http.StatusFound)
 			return
 		}
-		importRoot = importPath + "/" + elem
-		repoRoot = repoPath + "/" + elem
-	} else {
-		if path != importPath && !strings.HasPrefix(path, importPath+"/") {
-			http.NotFound(w, req)
+
+		vcsRoot := resolveRepoPath(req, m, elem)
+		d := &data{
+			ImportRoot: importRoot,
+			VCS:        *vcs,
+			VCSRoot:    vcsRoot,
+			Suffix:     suffix,
+			GoDocURL:   *godocURL,
+		}
+		var buf bytes.Buffer
+		if err := tmpl.Execute(&buf, d); err != nil {
+			http.Error(w, err.Error(), 500)
 			return
 		}
-		importRoot = importPath
-		repoRoot = repoPath
-		suffix = path[len(importPath):]
+		w.Write(buf.Bytes())
 	}
-	d := &data{
-		ImportRoot: importRoot,
-		VCS:        *vcs,
-		VCSRoot:    repoRoot,
-		Suffix:     suffix,
-		GoDocURL:   *godocURL,
+}
+
+// resolveRepoPath probes the first entries (old servers) to detect migration.
+// If an old server still has the repo → serve it. If all old servers are gone → serve last (new server).
+// Ambiguous errors default to serving the old server; persistent errors fall over to new.
+func resolveRepoPath(req *http.Request, m mapping, elem string) string {
+	candidate := func(rp string) string {
+		if m.wildcard > 0 {
+			return strings.Replace(rp, "*", elem, 1)
+		}
+		return rp
 	}
-	var buf bytes.Buffer
-	err := tmpl.Execute(&buf, d)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+	if len(m.repoPaths) == 1 {
+		return candidate(m.repoPaths[0])
 	}
-	w.Write(buf.Bytes())
+	if prober == nil || *vcs != "git" {
+		return candidate(m.repoPaths[0]) // can't probe non-git VCS with git ls-remote, assume old server
+	}
+	// Probe old servers (all but last); serve last (new server) only when all are gone.
+	for i := 0; i < len(m.repoPaths)-1; i++ {
+		if prober.Probe(req.Context(), candidate(m.repoPaths[i])) {
+			return candidate(m.repoPaths[i])
+		}
+	}
+	return candidate(m.repoPaths[len(m.repoPaths)-1])
 }
 
 func pong(w http.ResponseWriter, req *http.Request) {
