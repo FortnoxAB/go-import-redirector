@@ -88,7 +88,7 @@ func main() {
 	if *config != "" {
 		f, err := os.Open(*config)
 		if err != nil {
-			log.Printf("warning: cannot open config %s: %v; starting with no routes", *config, err)
+log.Fatalf("cannot open config %s: %v", *config, err)
 		} else {
 			defer f.Close()
 			var entries []configEntry
