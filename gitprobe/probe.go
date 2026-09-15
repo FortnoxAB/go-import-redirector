@@ -30,6 +30,10 @@ const maxConcurrentProbes = 32
 // A definitive "not found" and a repo that has been unreachable longer than
 // unreachableTTL are both treated as gone. Ambiguous errors (network, auth)
 // are cached briefly and default to "still exists" until the timeout elapses.
+// evictSweepInterval throttles the full-map eviction scan in evictLocked so
+// it runs periodically rather than on every single cache write.
+const evictSweepInterval = time.Minute
+
 type Prober struct {
 	ttl            time.Duration
 	errorTTL       time.Duration // short TTL for ambiguous errors
@@ -39,6 +43,7 @@ type Prober struct {
 	cache          map[string]cacheEntry
 	inflight       map[string]*probeCall // serializes concurrent probes of the same URL
 	sem            chan struct{}         // bounds concurrent git subprocesses across all URLs
+	nextSweep      time.Time             // evictLocked skips the full scan until this time, unless oversized
 }
 
 // probeCall lets concurrent callers for the same URL share one in-flight
@@ -79,6 +84,15 @@ func (p *Prober) Probe(ctx context.Context, repoURL string) bool {
 		case <-c.done:
 			return c.result
 		case <-ctx.Done():
+			// Our own context gave up before the in-flight probe finished;
+			// says nothing about the repo, so fall back to the last known
+			// result like the other cancellation paths in this file.
+			p.mu.Lock()
+			e, ok := p.cache[repoURL]
+			p.mu.Unlock()
+			if ok {
+				return e.exists
+			}
 			return true
 		}
 	}
@@ -101,10 +115,18 @@ func (p *Prober) Probe(ctx context.Context, repoURL string) bool {
 }
 
 func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince time.Time) bool {
+	// Bound the wait for a free probe slot by p.timeout too, so -probe-timeout
+	// caps total latency even when all slots are busy. This budget is only
+	// for acquiring a slot: the git subprocess below gets its own fresh
+	// p.timeout once started, so slot contention can never eat into (and
+	// thus falsely time out) the actual probe.
+	waitCtx, waitCancel := context.WithTimeout(ctx, p.timeout)
+	defer waitCancel()
+
 	select {
 	case p.sem <- struct{}{}:
 		defer func() { <-p.sem }()
-	case <-ctx.Done():
+	case <-waitCtx.Done():
 		// Caller gave up waiting for a free probe slot; says nothing about
 		// the repo, so don't touch the cache or outage tracking.
 		p.mu.Lock()
@@ -186,8 +208,17 @@ func redactForLog(repoURL string) string {
 // evictLocked removes entries that no longer need tracking, then—if the
 // cache is still oversized—falls back to dropping the oldest entries so
 // memory use stays bounded regardless of how many distinct keys are probed.
+// The full scan is throttled to evictSweepInterval (bypassed immediately if
+// the cache is actually oversized) since it's called after every probe and
+// would otherwise be an O(n) scan under the lock on every single write.
 // Callers must hold p.mu.
 func (p *Prober) evictLocked(now time.Time) {
+	oversized := len(p.cache) > maxCacheEntries
+	if !oversized && now.Before(p.nextSweep) {
+		return
+	}
+	p.nextSweep = now.Add(evictSweepInterval)
+
 	for k, e := range p.cache {
 		// unreachableSince must persist past expiry to track outages across
 		// errorTTL cycles, so only reap entries that no longer need that.
@@ -208,13 +239,27 @@ func (p *Prober) evictLocked(now time.Time) {
 	}
 }
 
-// isDefinitivelyGone reports whether stderr from git ls-remote indicates the
-// repo was cleanly rejected (as opposed to a network or auth failure).
+// definitivelyGoneMarkers lists stderr substrings from git ls-remote that
+// unambiguously mean "this isn't a git repo", not a transient/auth failure.
 // Deliberately excludes "repository not found"/"remote: not found": GitHub
 // (and other hosts) return that exact message both for a deleted repo and
 // for a private repo the credentials can't access, so it's ambiguous and
 // left to the unreachableTTL path instead of being treated as instant-gone.
+// Extend this list only with messages verified to be unambiguous on the
+// hosts/git versions actually in use; anything uncertain belongs in the
+// ambiguous/unreachableTTL path instead.
+var definitivelyGoneMarkers = []string{
+	"does not appear to be a git repository",
+}
+
+// isDefinitivelyGone reports whether stderr from git ls-remote indicates the
+// repo was cleanly rejected (as opposed to a network or auth failure).
 func isDefinitivelyGone(stderr string) bool {
 	s := strings.ToLower(stderr)
-	return strings.Contains(s, "does not appear to be a git repository")
+	for _, marker := range definitivelyGoneMarkers {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }

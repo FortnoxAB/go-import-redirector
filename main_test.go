@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -134,4 +136,57 @@ func TestHandlerWildcardSuffixFallback(t *testing.T) {
 	setProber(t, map[string]bool{"ssh://git@github.com/my-org/sune": true})
 	body = handlerResponse(t, makeHandler(m), "go.example.com", "/team/sune")
 	assertGoImport(t, body, "go.example.com/team/sune", "git", "ssh://git@github.com/my-org/sune")
+}
+
+func TestHandlerStripsBracketedIPv6HostPort(t *testing.T) {
+	m := parseMapping("::1/team/myrepo", []string{"ssh://git@git.example.com/team/myrepo"})
+	body := handlerResponse(t, makeHandler(m), "[::1]:8080", "/team/myrepo")
+	assertGoImport(t, body, "::1/team/myrepo", "git", "ssh://git@git.example.com/team/myrepo")
+}
+
+func TestHandlerStripsPlainHostPort(t *testing.T) {
+	m := parseMapping("go.example.com/team/myrepo", []string{"ssh://git@git.example.com/team/myrepo"})
+	body := handlerResponse(t, makeHandler(m), "go.example.com:8080", "/team/myrepo")
+	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@git.example.com/team/myrepo")
+}
+
+// TestFatalValidation exercises the log.Fatal-based validation paths in
+// parseMapping/registerMapping. These call os.Exit, so each case re-execs
+// this test binary as a subprocess (the standard pattern for testing
+// os.Exit-calling code) and asserts it exits non-zero.
+func TestFatalValidation(t *testing.T) {
+	cases := map[string]func(){
+		"MismatchedWildcard": func() {
+			parseMapping("go.example.com/*", []string{"ssh://git@git.example.com/team/repo"})
+		},
+		"RepoNotFullURL": func() {
+			parseMapping("go.example.com/team/myrepo", []string{"git.example.com/team/myrepo"})
+		},
+		"MultipleWildcardsInRepo": func() {
+			parseMapping("go.example.com/*", []string{"ssh://git@git.example.com/*/repo-*"})
+		},
+		"NoRepos": func() {
+			parseMapping("go.example.com/team/myrepo", nil)
+		},
+		"DuplicateImportPath": func() {
+			m := mapping{importPath: "go.example.com/team/myrepo"}
+			registerMapping(m)
+			registerMapping(m)
+		},
+	}
+	for name, fn := range cases {
+		t.Run(name, func(t *testing.T) {
+			if os.Getenv("GO_WANT_FATAL_TEST_PROCESS") == name {
+				fn()
+				return
+			}
+			cmd := exec.Command(os.Args[0], "-test.run=TestFatalValidation/"+name)
+			cmd.Env = append(os.Environ(), "GO_WANT_FATAL_TEST_PROCESS="+name)
+			out, err := cmd.CombinedOutput()
+			if exitErr, ok := err.(*exec.ExitError); ok && !exitErr.Success() {
+				return
+			}
+			t.Fatalf("expected process to exit with a fatal error; output:\n%s\nerr: %v", out, err)
+		})
+	}
 }

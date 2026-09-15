@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -64,6 +65,10 @@ type repoProber interface {
 }
 
 var prober repoProber
+
+// registeredImportPaths guards against registering the same HTTP pattern
+// twice, which would otherwise panic inside http.HandleFunc.
+var registeredImportPaths = map[string]bool{}
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage: go-import-redirector [-config file] [<import> <origin>]\n")
@@ -102,7 +107,7 @@ func main() {
 	} else if flag.NArg() == 2 {
 		registerMapping(parseMapping(flag.Arg(0), []string{flag.Arg(1)}))
 	} else {
-		log.Print("no -config or import/origin args provided; starting with no routes registered")
+		usage()
 	}
 
 	if err := http.ListenAndServe(*addr, nil); err != nil {
@@ -121,7 +126,13 @@ func parseMapping(imp string, repos []string) mapping {
 		}
 		// repoPaths use a literal "*" placeholder (optionally with a static suffix/prefix
 		// in the same segment, e.g. "*-go-lib" or "go-*", to rename a repo during migration).
-		if isWildcard != strings.Contains(r, "*") {
+		// Exactly one "*" is required: candidate() only substitutes the first
+		// occurrence, so a second "*" would silently survive into the VCS URL.
+		count := strings.Count(r, "*")
+		if isWildcard && count != 1 {
+			log.Fatalf("repo must contain exactly one \"*\" placeholder: %s", r)
+		}
+		if !isWildcard && count != 0 {
 			log.Fatalf("import and repos must have matching /* wildcards: %s vs %s", imp, r)
 		}
 	}
@@ -134,6 +145,10 @@ func parseMapping(imp string, repos []string) mapping {
 }
 
 func registerMapping(m mapping) {
+	if registeredImportPaths[m.importPath] {
+		log.Fatalf("duplicate importPath in config: %s", m.importPath)
+	}
+	registeredImportPaths[m.importPath] = true
 	http.HandleFunc(strings.TrimSuffix(m.importPath, "/")+"/", makeHandler(m))
 	http.HandleFunc(m.importPath+"/.ping", pong)
 }
@@ -162,8 +177,8 @@ type data struct {
 func makeHandler(m mapping) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		host := req.Host
-		if i := strings.LastIndex(host, ":"); i != -1 && !strings.Contains(host, "]") {
-			host = host[:i] // strip port; import paths never include one
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h // strip port (including bracketed IPv6); import paths never include one
 		}
 		path := strings.TrimSuffix(host+req.URL.Path, "/")
 		var importRoot, suffix string

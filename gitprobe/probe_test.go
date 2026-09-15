@@ -2,7 +2,11 @@ package gitprobe
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +26,25 @@ func initRepo(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return dir
+}
+
+// stubGit installs a fake "git" executable at the front of PATH for the
+// duration of the test, so ls-remote timing/output can be controlled
+// deterministically instead of depending on a real (network) remote.
+// sleep is how long the stub waits before exiting; exitCode and stderr
+// control the simulated git ls-remote result.
+func stubGit(t *testing.T, sleep time.Duration, exitCode int, stderr string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("stub git script requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := fmt.Sprintf("#!/bin/sh\nsleep %f\n>&2 printf '%%s' %q\nexit %d\n", sleep.Seconds(), stderr, exitCode)
+	path := filepath.Join(dir, "git")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func TestProbeFound(t *testing.T) {
@@ -93,4 +116,204 @@ func TestProbeConcurrent(t *testing.T) {
 		go func() { defer wg.Done(); p.Probe(context.Background(), url) }()
 	}
 	wg.Wait()
+}
+
+// TestProbeInflightJoinCancelFallsBackToCache guards against the join branch
+// of Probe unconditionally answering "exists" on cancellation instead of
+// consulting the cache like every other cancellation path in this file.
+func TestProbeInflightJoinCancelFallsBackToCache(t *testing.T) {
+	const url = "file:///whatever-inflight-cancel-test"
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
+
+	p.mu.Lock()
+	p.cache[url] = cacheEntry{exists: false, expires: time.Now().Add(-time.Second)} // expired
+	p.inflight = map[string]*probeCall{url: {done: make(chan struct{})}}            // never completes
+	p.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := p.Probe(ctx, url); got != false {
+		t.Errorf("expected fallback to cached exists=false, got %v", got)
+	}
+}
+
+// TestProbeInflightJoinCancelNoCacheDefaultsExists checks the same path
+// defaults to "exists" (the documented safe default) when there is nothing
+// cached to fall back to.
+func TestProbeInflightJoinCancelNoCacheDefaultsExists(t *testing.T) {
+	const url = "file:///whatever-inflight-cancel-nocache-test"
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
+
+	p.mu.Lock()
+	p.inflight = map[string]*probeCall{url: {done: make(chan struct{})}} // never completes
+	p.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := p.Probe(ctx, url); got != true {
+		t.Errorf("expected safe default exists=true, got %v", got)
+	}
+}
+
+// TestProbeCallerCancelFallsBackToCache verifies that if the caller's own
+// context is canceled mid-probe (as opposed to our own timeout elapsing),
+// the result falls back to the last cached value instead of touching it.
+func TestProbeCallerCancelFallsBackToCache(t *testing.T) {
+	stubGit(t, 2*time.Second, 0, "")
+	const url = "ssh://example.invalid/repo"
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
+	p.mu.Lock()
+	p.cache[url] = cacheEntry{exists: true, expires: time.Now().Add(-time.Second)} // expired
+	p.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	if got := p.Probe(ctx, url); got != true {
+		t.Errorf("expected fallback to cached exists=true on caller cancellation, got %v", got)
+	}
+}
+
+// TestProbeSlotWaitDoesNotStarveExecTimeout is a regression test for the
+// bug where the semaphore-wait budget and the git-exec budget shared one
+// context: a probe that waited nearly the full p.timeout for a free slot
+// would then have almost no time left to actually run git ls-remote. The
+// slot wait and the exec must each get their own fresh p.timeout budget.
+func TestProbeSlotWaitDoesNotStarveExecTimeout(t *testing.T) {
+	const timeout = 500 * time.Millisecond
+	const holdDuration = 300 * time.Millisecond // < timeout, but leaves little of it once acquired
+	const execSleep = 350 * time.Millisecond    // > timeout-holdDuration, but < a fresh timeout
+
+	stubGit(t, execSleep, 0, "")
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, timeout)
+
+	// Saturate every probe slot, then release exactly one after holdDuration
+	// so the incoming Probe call spends holdDuration just waiting.
+	for range maxConcurrentProbes {
+		p.sem <- struct{}{}
+	}
+	time.AfterFunc(holdDuration, func() { <-p.sem })
+
+	const url = "ssh://example.invalid/slow-repo"
+	if got := p.Probe(context.Background(), url); got != true {
+		t.Fatalf("expected exec to succeed with its own fresh timeout budget, got %v", got)
+	}
+	// A return of true alone doesn't distinguish success from the buggy
+	// shared-budget case, since an ambiguous/timed-out error also defaults
+	// to "true" (safe default). Inspect the cache entry to tell them apart:
+	// a genuine success caches with the full p.ttl and no outage tracking,
+	// while a starved exec would be misclassified as an ambiguous error,
+	// cached with the short errorTTL and a non-zero unreachableSince.
+	p.mu.Lock()
+	e, ok := p.cache[url]
+	p.mu.Unlock()
+	if !ok {
+		t.Fatal("expected a cache entry after probe")
+	}
+	if !e.unreachableSince.IsZero() {
+		t.Errorf("exec was starved and misclassified as an ambiguous error (unreachableSince=%v)", e.unreachableSince)
+	}
+	if time.Until(e.expires) < time.Minute {
+		t.Errorf("expected a full-ttl cache entry from a genuine success, got expires in %v", time.Until(e.expires))
+	}
+}
+
+// TestProbeAmbiguousErrorEscalatesAfterUnreachableTTL verifies the
+// unreachableSince accumulation: a repo that keeps returning ambiguous
+// errors is treated as "still exists" until unreachableTTL has elapsed,
+// after which it flips to "gone".
+func TestProbeAmbiguousErrorEscalatesAfterUnreachableTTL(t *testing.T) {
+	stubGit(t, 0, 1, "fatal: could not read from remote repository")
+	const unreachableTTL = 50 * time.Millisecond
+	p := New(time.Hour, 10*time.Millisecond, unreachableTTL, 5*time.Second)
+	const url = "ssh://example.invalid/flaky-repo"
+
+	if got := p.Probe(context.Background(), url); got != true {
+		t.Fatalf("expected ambiguous error to default to exists=true before unreachableTTL, got %v", got)
+	}
+	time.Sleep(unreachableTTL + 20*time.Millisecond)
+	if got := p.Probe(context.Background(), url); got != false {
+		t.Errorf("expected repo to be treated as gone after unreachableTTL of ambiguous errors, got %v", got)
+	}
+}
+
+func TestEvictLockedRemovesExpiredKeepsOutageTrackingAndBoundsSize(t *testing.T) {
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
+	now := time.Now()
+
+	p.cache["expired-no-outage"] = cacheEntry{exists: true, expires: now.Add(-time.Second)}
+	p.cache["expired-with-outage"] = cacheEntry{exists: false, expires: now.Add(-time.Second), unreachableSince: now.Add(-time.Minute)}
+	p.cache["not-expired"] = cacheEntry{exists: true, expires: now.Add(time.Hour)}
+	p.evictLocked(now)
+
+	if _, ok := p.cache["expired-no-outage"]; ok {
+		t.Error("expected expired entry with no outage tracking to be evicted")
+	}
+	if _, ok := p.cache["expired-with-outage"]; !ok {
+		t.Error("expected expired entry with active outage tracking to be kept")
+	}
+	if _, ok := p.cache["not-expired"]; !ok {
+		t.Error("expected unexpired entry to be kept")
+	}
+
+	p.cache = make(map[string]cacheEntry)
+	for i := range maxCacheEntries + 50 {
+		p.cache[fmt.Sprintf("overflow-%d", i)] = cacheEntry{exists: true, expires: now.Add(time.Hour)}
+	}
+	p.evictLocked(now)
+	if len(p.cache) > maxCacheEntries {
+		t.Errorf("expected cache to be bounded to %d entries, got %d", maxCacheEntries, len(p.cache))
+	}
+}
+
+// TestEvictLockedThrottlesFullScan guards the optimization that skips the
+// O(n) expired-entry scan until evictSweepInterval has passed (unless the
+// cache is actually oversized), so it isn't redone on every single write.
+func TestEvictLockedThrottlesFullScan(t *testing.T) {
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
+	now := time.Now()
+
+	// First call always sweeps (nextSweep zero value) and schedules the next one.
+	p.evictLocked(now)
+
+	p.cache["expired"] = cacheEntry{exists: true, expires: now.Add(-time.Second)}
+	p.evictLocked(now) // well within evictSweepInterval of the first call
+	if _, ok := p.cache["expired"]; !ok {
+		t.Error("expected sweep to be throttled, leaving the expired entry in place")
+	}
+
+	p.evictLocked(now.Add(evictSweepInterval + time.Second))
+	if _, ok := p.cache["expired"]; ok {
+		t.Error("expected sweep to run once evictSweepInterval elapsed, removing the expired entry")
+	}
+}
+
+func TestRedactForLog(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"ssh://user:secret@example.com/repo", "ssh://redacted@example.com/repo"},
+		{"https://example.com/repo", "https://example.com/repo"},
+		{"not a url", "not a url"},
+	}
+	for _, c := range cases {
+		if got := redactForLog(c.in); got != c.want {
+			t.Errorf("redactForLog(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestIsDefinitivelyGone(t *testing.T) {
+	cases := []struct {
+		stderr string
+		want   bool
+	}{
+		{"fatal: 'x' does not appear to be a git repository", true},
+		{"DOES NOT APPEAR TO BE A GIT REPOSITORY", true},
+		{"remote: Repository not found.", false}, // ambiguous: deleted vs. private
+		{"fatal: could not read from remote repository", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isDefinitivelyGone(c.stderr); got != c.want {
+			t.Errorf("isDefinitivelyGone(%q) = %v, want %v", c.stderr, got, c.want)
+		}
+	}
 }
