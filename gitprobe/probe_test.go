@@ -88,7 +88,7 @@ func TestProbeConcurrent(t *testing.T) {
 	url := "file://" + initRepo(t)
 	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
 	var wg sync.WaitGroup
-	for range 10 {
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() { defer wg.Done(); p.Probe(context.Background(), url) }()
 	}

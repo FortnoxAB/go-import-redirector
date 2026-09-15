@@ -135,4 +135,3 @@ func TestHandlerWildcardSuffixFallback(t *testing.T) {
 	body = handlerResponse(t, makeHandler(m), "go.example.com", "/team/sune")
 	assertGoImport(t, body, "go.example.com/team/sune", "git", "ssh://git@github.com/my-org/sune")
 }
-

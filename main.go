@@ -37,10 +37,10 @@ import (
 )
 
 var (
-	addr               = flag.String("addr", ":http", "serve http on `address`")
-	vcs                = flag.String("vcs", "git", "set version control `system`")
-	godocURL           = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
-	config             = flag.String("config", "", "path to JSON config file (see redirects.example.json)")
+	addr                = flag.String("addr", ":http", "serve http on `address`")
+	vcs                 = flag.String("vcs", "git", "set version control `system`")
+	godocURL            = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
+	config              = flag.String("config", "", "path to JSON config file (see redirects.example.json)")
 	probeCacheTTL       = flag.Duration("probe-cache-ttl", 10*time.Minute, "how long to cache definitive probe results")
 	probeErrorTTL       = flag.Duration("probe-error-ttl", 30*time.Second, "how long to cache ambiguous probe errors before retry")
 	probeUnreachableTTL = flag.Duration("probe-unreachable-ttl", 15*time.Minute, "assume repo migrated if old server is unreachable this long")
@@ -88,7 +88,7 @@ func main() {
 	if *config != "" {
 		f, err := os.Open(*config)
 		if err != nil {
-log.Fatalf("cannot open config %s: %v", *config, err)
+			log.Fatalf("cannot open config %s: %v", *config, err)
 		} else {
 			defer f.Close()
 			var entries []configEntry

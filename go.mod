@@ -1,3 +1,3 @@
 module github.com/fortnoxab/go-import-redirector
 
-go 1.25.0
+go 1.13
