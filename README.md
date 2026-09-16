@@ -1,6 +1,6 @@
 # go-import-redirector
 
-An HTTP service that implements Go's [vanity import path](https://pkg.go.dev/cmd/go#hdr-Remote_import_paths) protocol. It serves `go-import` meta tags so that `go get` can resolve custom import paths (e.g. `go.fnox.se/gl/myrepo`) to the actual VCS repository.
+An HTTP service that implements Go's [vanity import path](https://pkg.go.dev/cmd/go#hdr-Remote_import_paths) protocol. It serves `go-import` meta tags so that `go get` can resolve custom import paths (e.g. `go.example.com/gl/myrepo`) to the actual VCS repository.
 
 ## How it works
 
@@ -139,4 +139,3 @@ Docker image:
 ```sh
 make docker VERSION=1.0.0
 ```
-

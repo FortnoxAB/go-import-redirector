@@ -31,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,15 +39,38 @@ import (
 )
 
 var (
-	addr                = flag.String("addr", ":http", "serve http on `address`")
+	addr                = flag.String("addr", ":8080", "serve http on `address`")
 	vcs                 = flag.String("vcs", "git", "set version control `system`")
 	godocURL            = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
-	config              = flag.String("config", "", "path to JSON config file (see redirects.example.json)")
+	config              = flag.String("config", os.Getenv("CONFIG"), "path to JSON config file (see redirects.example.json); defaults to the CONFIG env var")
 	probeCacheTTL       = flag.Duration("probe-cache-ttl", 10*time.Minute, "how long to cache definitive probe results")
 	probeErrorTTL       = flag.Duration("probe-error-ttl", 30*time.Second, "how long to cache ambiguous probe errors before retry")
 	probeUnreachableTTL = flag.Duration("probe-unreachable-ttl", 15*time.Minute, "assume repo migrated if old server is unreachable this long")
 	probeTimeout        = flag.Duration("probe-timeout", 5*time.Second, "timeout per git ls-remote probe")
+	verbose             = flag.Bool("verbose", envBool("VERBOSE", false), "log every request and probe attempt (noisy); defaults to the VERBOSE env var")
 )
+
+// envBool reads a boolean from the named environment variable, falling back
+// to def if unset or unparseable. Used to seed flag defaults from the
+// environment (e.g. for container deployments configured via env vars).
+func envBool(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
+}
+
+// logVerbose logs only when -verbose is set.
+func logVerbose(format string, args ...any) {
+	if *verbose {
+		log.Printf(format, args...)
+	}
+}
 
 type configEntry struct {
 	ImportPath string   `json:"importPath"`
@@ -85,6 +109,7 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 	*godocURL = strings.TrimRight(*godocURL, "/")
+	gitprobe.Verbose = *verbose
 
 	prober = gitprobe.New(*probeCacheTTL, *probeErrorTTL, *probeUnreachableTTL, *probeTimeout)
 	log.Printf("git SSH probing enabled (cache TTL: %v, error TTL: %v, unreachable TTL: %v)",
@@ -100,7 +125,9 @@ func main() {
 			if err := json.NewDecoder(f).Decode(&entries); err != nil {
 				log.Fatalf("parsing config: %v", err)
 			}
+			log.Printf("config: %s: loaded %d mapping(s)", *config, len(entries))
 			for _, e := range entries {
+				log.Printf("config: mapping importPath=%q repoPaths=%q", e.ImportPath, e.RepoPaths)
 				registerMapping(parseMapping(e.ImportPath, e.RepoPaths))
 			}
 		}
@@ -110,9 +137,20 @@ func main() {
 		usage()
 	}
 
-	if err := http.ListenAndServe(*addr, nil); err != nil {
+	log.Printf("listening on %s", *addr)
+	if err := http.ListenAndServe(*addr, logRequests(http.DefaultServeMux)); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// logRequests logs every incoming request before routing, so a request that
+// matches no registered pattern (and would otherwise 404 silently) is still
+// visible.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		logVerbose("request: %s %s%s from %s", req.Method, req.Host, req.URL.RequestURI(), req.RemoteAddr)
+		next.ServeHTTP(w, req)
+	})
 }
 
 func parseMapping(imp string, repos []string) mapping {
@@ -176,6 +214,7 @@ type data struct {
 
 func makeHandler(m mapping) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
+		logVerbose("handler: %s %s%s (importPath=%q go-get=%q)", req.Method, req.Host, req.URL.RequestURI(), m.importPath, req.URL.Query().Get("go-get"))
 		host := req.Host
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h // strip port (including bracketed IPv6); import paths never include one
@@ -186,6 +225,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 		if m.wildcard > 0 {
 			if path == m.importPath {
 				if *godocURL == "" {
+					logVerbose("handler: %s: no -godoc-url set, replying 404", path)
 					http.NotFound(w, req)
 					return
 				}
@@ -193,6 +233,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 				return
 			}
 			if !strings.HasPrefix(path, m.importPath+"/") {
+				logVerbose("handler: %s: does not match importPath %q, replying 404", path, m.importPath)
 				http.NotFound(w, req)
 				return
 			}
@@ -204,12 +245,14 @@ func makeHandler(m mapping) http.HandlerFunc {
 					suffix = "/" + suffix
 				}
 			} else {
+				logVerbose("handler: %s: not enough path elements for wildcard %q, replying 404", path, m.importPath)
 				http.NotFound(w, req)
 				return
 			}
 			importRoot = m.importPath + "/" + elem
 		} else {
 			if path != m.importPath && !strings.HasPrefix(path, m.importPath+"/") {
+				logVerbose("handler: %s: does not match importPath %q, replying 404", path, m.importPath)
 				http.NotFound(w, req)
 				return
 			}
@@ -219,6 +262,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 
 		if req.URL.Query().Get("go-get") != "1" {
 			if *godocURL == "" {
+				logVerbose("handler: %s: no go-get=1 and no -godoc-url set, replying 404", path)
 				http.NotFound(w, req)
 				return
 			}
@@ -226,6 +270,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 			return
 		}
 
+		logVerbose("handler: %s: resolving VCS root for elem=%q", importRoot, elem)
 		vcsRoot := resolveRepoPath(req, m, elem)
 		d := &data{
 			ImportRoot: importRoot,

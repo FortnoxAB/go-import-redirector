@@ -2,7 +2,7 @@
 
 IMAGE = quay.io/fortnox/go-import-redirector
 # supply when running make: make all VERSION=1.0.0
-#VERSION = 0.0.1 
+#VERSION = 0.0.1
 
 build:
 	CGO_ENABLED=0 GOOS=linux go build

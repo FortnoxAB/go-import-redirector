@@ -26,14 +26,26 @@ const maxCacheEntries = 10000
 // requests for many distinct wildcard names can't exhaust process/CPU/memory.
 const maxConcurrentProbes = 32
 
-// Prober checks git repo existence via git ls-remote and caches results.
-// A definitive "not found" and a repo that has been unreachable longer than
-// unreachableTTL are both treated as gone. Ambiguous errors (network, auth)
-// are cached briefly and default to "still exists" until the timeout elapses.
+// Verbose enables logging of every probe attempt (not just found/not-found
+// state changes and errors). Intended to be set once at startup from a CLI
+// flag; noisy in production if left on.
+var Verbose bool
+
+// logVerbose logs only when Verbose is enabled.
+func logVerbose(format string, args ...any) {
+	if Verbose {
+		log.Printf(format, args...)
+	}
+}
+
 // evictSweepInterval throttles the full-map eviction scan in evictLocked so
 // it runs periodically rather than on every single cache write.
 const evictSweepInterval = time.Minute
 
+// Prober checks git repo existence via git ls-remote and caches results.
+// A definitive "not found" and a repo that has been unreachable longer than
+// unreachableTTL are both treated as gone. Ambiguous errors (network, auth)
+// are cached briefly and default to "still exists" until the timeout elapses.
 type Prober struct {
 	ttl            time.Duration
 	errorTTL       time.Duration // short TTL for ambiguous errors
@@ -141,6 +153,8 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 	timeoutCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
+	logVerbose("gitprobe: probing %s", redactForLog(repoURL))
+
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(timeoutCtx, "git", "ls-remote", repoURL)
 	cmd.Stderr = &stderr
@@ -148,6 +162,7 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 
 	now := time.Now()
 	if err == nil {
+		logVerbose("gitprobe: %s: found", redactForLog(repoURL))
 		p.mu.Lock()
 		p.cache[repoURL] = cacheEntry{exists: true, expires: now.Add(p.ttl)}
 		p.evictLocked(now)
@@ -180,7 +195,7 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 
 	// Ambiguous error (network, auth, timeout): safe default is "still exists"
 	// unless we've been failing continuously longer than unreachableTTL.
-	log.Printf("gitprobe: %s: %v", redactForLog(repoURL), err)
+	log.Printf("gitprobe: %s: %v: %s", redactForLog(repoURL), err, strings.TrimSpace(stderr.String()))
 	if unreachableSince.IsZero() {
 		unreachableSince = now
 	}
