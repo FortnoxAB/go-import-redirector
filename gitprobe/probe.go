@@ -240,16 +240,20 @@ func (p *Prober) evictLocked(now time.Time) {
 }
 
 // definitivelyGoneMarkers lists stderr substrings from git ls-remote that
-// unambiguously mean "this isn't a git repo", not a transient/auth failure.
-// Deliberately excludes "repository not found"/"remote: not found": GitHub
-// (and other hosts) return that exact message both for a deleted repo and
-// for a private repo the credentials can't access, so it's ambiguous and
-// left to the unreachableTTL path instead of being treated as instant-gone.
-// Extend this list only with messages verified to be unambiguous on the
-// hosts/git versions actually in use; anything uncertain belongs in the
-// ambiguous/unreachableTTL path instead.
+// mean "treat this repoPath as gone", triggering immediate fallover instead
+// of waiting out unreachableTTL. GitHub (and other hosts) return "repository
+// not found" both for a deleted repo and for a private repo the credentials
+// can't access — but a fully broken/revoked key surfaces as a distinct SSH-
+// level "Permission denied (publickey)" error instead (handled by the
+// ambiguous/unreachableTTL path), so in practice "not found" overwhelmingly
+// means "doesn't exist here (yet)", which matters for configs that probe the
+// new server first and fall back to a trusted old one: treating it as
+// ambiguous would serve a broken URL for every not-yet-migrated repo until
+// unreachableTTL elapses.
 var definitivelyGoneMarkers = []string{
 	"does not appear to be a git repository",
+	"repository not found",
+	"remote: not found",
 }
 
 // isDefinitivelyGone reports whether stderr from git ls-remote indicates the

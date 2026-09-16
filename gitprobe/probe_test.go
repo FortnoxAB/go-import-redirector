@@ -307,7 +307,7 @@ func TestIsDefinitivelyGone(t *testing.T) {
 	}{
 		{"fatal: 'x' does not appear to be a git repository", true},
 		{"DOES NOT APPEAR TO BE A GIT REPOSITORY", true},
-		{"remote: Repository not found.", false}, // ambiguous: deleted vs. private
+		{"remote: Repository not found.", true}, // treated as gone, not ambiguous; see definitivelyGoneMarkers
 		{"fatal: could not read from remote repository", false},
 		{"", false},
 	}
