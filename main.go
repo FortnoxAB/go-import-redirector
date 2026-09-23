@@ -127,7 +127,7 @@ func main() {
 			}
 			log.Printf("config: %s: loaded %d mapping(s)", *config, len(entries))
 			for _, e := range entries {
-				log.Printf("config: mapping importPath=%q repoPaths=%q", e.ImportPath, e.RepoPaths)
+log.Printf("config: mapping importPath=%q", e.ImportPath)
 				registerMapping(parseMapping(e.ImportPath, e.RepoPaths))
 			}
 		}
