@@ -195,7 +195,7 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 
 	// Ambiguous error (network, auth, timeout): safe default is "still exists"
 	// unless we've been failing continuously longer than unreachableTTL.
-	log.Printf("gitprobe: %s: %v: %s", redactForLog(repoURL), err, strings.TrimSpace(stderr.String()))
+log.Printf("gitprobe: %s: %v", redactForLog(repoURL), err)
 	if unreachableSince.IsZero() {
 		unreachableSince = now
 	}
