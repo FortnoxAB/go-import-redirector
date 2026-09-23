@@ -173,6 +173,28 @@ func TestProbeCallerCancelFallsBackToCache(t *testing.T) {
 	}
 }
 
+// TestProbeCallerDeadlineDoesNotRecordOutage verifies that a request-level
+// deadline is treated the same as other caller-driven cancellations: it must
+// not create or update outage tracking for the repo.
+func TestProbeCallerDeadlineDoesNotRecordOutage(t *testing.T) {
+	stubGit(t, 2*time.Second, 0, "")
+	const url = "ssh://example.invalid/deadline-repo"
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if got := p.Probe(ctx, url); got != true {
+		t.Fatalf("expected safe default exists=true on caller deadline, got %v", got)
+	}
+
+	p.mu.Lock()
+	_, ok := p.cache[url]
+	p.mu.Unlock()
+	if ok {
+		t.Fatal("expected caller deadline to leave cache and outage tracking untouched")
+	}
+}
+
 // TestProbeSlotWaitDoesNotStarveExecTimeout is a regression test for the
 // bug where the semaphore-wait budget and the git-exec budget shared one
 // context: a probe that waited nearly the full p.timeout for a free slot

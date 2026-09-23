@@ -3,7 +3,6 @@ package gitprobe
 import (
 	"bytes"
 	"context"
-	"errors"
 	"log"
 	"net/url"
 	"os/exec"
@@ -180,10 +179,11 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 		return false
 	}
 
-	// The caller (HTTP request) was canceled/disconnected before our own
-	// timeout elapsed; that says nothing about the repo, so leave the cache
-	// and outage tracking untouched and fall back to the last known result.
-	if errors.Is(timeoutCtx.Err(), context.Canceled) {
+	// The caller (HTTP request) was canceled/disconnected or hit its own
+	// deadline before our own timeout elapsed; that says nothing about the
+	// repo, so leave the cache and outage tracking untouched and fall back
+	// to the last known result.
+	if ctx.Err() != nil {
 		p.mu.Lock()
 		e, ok := p.cache[repoURL]
 		p.mu.Unlock()
@@ -195,7 +195,7 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 
 	// Ambiguous error (network, auth, timeout): safe default is "still exists"
 	// unless we've been failing continuously longer than unreachableTTL.
-log.Printf("gitprobe: %s: %v", redactForLog(repoURL), err)
+	log.Printf("gitprobe: %s: %v", redactForLog(repoURL), err)
 	if unreachableSince.IsZero() {
 		unreachableSince = now
 	}
