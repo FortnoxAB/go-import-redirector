@@ -138,6 +138,42 @@ func TestHandlerWildcardSuffixFallback(t *testing.T) {
 	assertGoImport(t, body, "go.example.com/team/sune", "git", "ssh://git@github.com/my-org/sune")
 }
 
+func TestHandlerMultiLevelWildcard(t *testing.T) {
+	setProber(t, nil)
+	cases := []struct{ repo, want string }{
+		{"https://github.com/*/*", "https://github.com/a/b"},       // one "*" per level
+		{"https://github.com/*", "https://github.com/a/b"},         // whole-segment "*" takes the whole elem
+		{"https://github.com/*/go-*", "https://github.com/a/go-b"}, // per-level rename
+	}
+	for _, c := range cases {
+		m := parseMapping("rsc.io/*/*", []string{c.repo})
+		body := handlerResponse(t, makeHandler(m), "rsc.io", "/a/b/sub/pkg")
+		assertGoImport(t, body, "rsc.io/a/b", "git", c.want)
+	}
+}
+
+func TestHandlerRejectsInvalidElem(t *testing.T) {
+	fp := setProber(t, map[string]bool{})
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@git.example.com/team/*", "ssh://git@github.com/my-org/*"})
+	for _, target := range []string{
+		"/team/..%2Fsecret?go-get=1", // decodes to elem ".."
+		"/team/.?go-get=1",
+		"/team/foo%0Agitprobe:%20forged?go-get=1", // newline would forge a log line
+		"/team/foo%20bar?go-get=1",
+	} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.Host = "go.example.com"
+		rec := httptest.NewRecorder()
+		makeHandler(m).ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s: expected 404, got %d: %s", target, rec.Code, rec.Body.String())
+		}
+	}
+	if len(fp.calls) != 0 {
+		t.Errorf("invalid elems must never be probed; calls: %q", fp.calls)
+	}
+}
+
 func TestHandlerStripsBracketedIPv6HostPort(t *testing.T) {
 	m := parseMapping("::1/team/myrepo", []string{"ssh://git@git.example.com/team/myrepo"})
 	body := handlerResponse(t, makeHandler(m), "[::1]:8080", "/team/myrepo")
@@ -164,6 +200,12 @@ func TestFatalValidation(t *testing.T) {
 		},
 		"MultipleWildcardsInRepo": func() {
 			parseMapping("go.example.com/*", []string{"ssh://git@git.example.com/*/repo-*"})
+		},
+		"MultiLevelWrongStarCount": func() {
+			parseMapping("go.example.com/*/*/*", []string{"ssh://git@git.example.com/*/*"})
+		},
+		"MultiLevelSingleStarNotWholeSegment": func() {
+			parseMapping("go.example.com/*/*", []string{"ssh://git@git.example.com/go-*"})
 		},
 		"NoRepos": func() {
 			parseMapping("go.example.com/team/myrepo", nil)

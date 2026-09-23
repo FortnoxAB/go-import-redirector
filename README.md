@@ -22,9 +22,11 @@ For each request the service:
 2. Probes each `repoPaths` entry **except the last** via `git ls-remote`, in order, to check whether the repo is there.
 3. Serves the first entry that's found. Once none of the probed entries have the repo, the last entry is served automatically — it is never probed, it's the trusted default.
 
-Probe results are cached (`-probe-cache-ttl`, default 10 minutes). Ambiguous errors (network outage, timeout, SSH key rejected) are retried after a shorter interval (`-probe-error-ttl`, default 30 seconds) and default to "still there" for whichever entry is being probed — so a transient outage never wrongly flips traffic. If an entry has been unreachable for longer than `-probe-unreachable-ttl` (default 15 minutes), it is treated as gone and the next entry in the list is served instead.
+Probe results are cached (`-probe-cache-ttl`, default 10 minutes). Ambiguous errors (network outage, timeout) are retried after a shorter interval (`-probe-error-ttl`, default 30 seconds) and default to "still there" for whichever entry is being probed — so a transient outage never wrongly flips traffic. If an entry has been unreachable for longer than `-probe-unreachable-ttl` (default 15 minutes), it is treated as gone and the next entry in the list is served instead.
 
-**Not found vs. no access:** GitHub and Bitbucket answer `Repository not found` both when a repo doesn't exist and when the probe's key authenticates but can't read that (private) repo. The service can't tell these apart, so both count as "gone" and it falls over to the next entry immediately — treating them as ambiguous would instead serve a broken URL for every not-yet-migrated repo in a new-first config until `-probe-unreachable-ttl` elapses. The flip side: if the probe key loses read access to a probed server, its repos fall over at once. These probes are logged as `not found (or no read access)`; see [SSH configuration](#ssh-configuration).
+**Not found vs. no access:** GitHub and Bitbucket answer `Repository not found` both when a repo doesn't exist and when the probe's key authenticates but can't read that (private) repo. The service can't tell these apart, so both count as "gone" and it falls over to the next entry immediately — treating them as ambiguous would instead serve a broken URL for every not-yet-migrated repo in a new-first config until `-probe-unreachable-ttl` elapses. The flip side: if the probe key loses read access to a probed server, its repos fall over at once. Hosts that answer such requests over HTTPS with `401` instead (e.g. GitLab) are treated the same way, since probes never prompt for credentials. These probes are logged as `not found (or no read access)`; see [SSH configuration](#ssh-configuration).
+
+**Misconfigured probes:** errors that come from the probe's own setup rather than the repo — an unknown SSH host key, or an SSH key or HTTPS credentials the host rejects outright — say nothing about whether a repo moved. They keep serving the probed entry and never count towards `-probe-unreachable-ttl`, so a broken deployment can't silently fail everything over after 15 minutes. They're logged as `probe misconfigured` together with git's error message.
 
 The order of `repoPaths` decides which server is trusted by default: put the old server first and the new one last to migrate only once the old repo is confirmed gone (the classic case), or the other way around to switch to the new server as soon as it exists, without waiting for the old one to be decommissioned (see `redirects.example.json`, which checks GitHub first and falls back to the old server).
 
@@ -50,6 +52,10 @@ Copy `redirects.example.json` to `redirects.json` (which is git-ignored) and fil
 | `repoPaths` | yes | Ordered list of VCS URLs. All entries except the last are probed, in order; the first one found is served. The last entry is never probed — it's the trusted default once the others are gone (or not yet created). No config change is needed as individual repos migrate. |
 
 A request for `go.example.com/team/myrepo/v2` produces `importRoot = go.example.com/team/myrepo` regardless of major version suffix.
+
+An `importPath` can end in several `/*` levels, e.g. `go.example.com/*/*` to match `go.example.com/team/myrepo`. Each `repoPaths` entry then uses either one `*` per level, substituted in order (`ssh://git@github.com/*/go-*` → `ssh://git@github.com/team/go-myrepo`), or a single `*` that is a whole path segment and stands for all matched levels (`ssh://git@github.com/*` → `ssh://git@github.com/team/myrepo`).
+
+Matched wildcard segments must be valid Go import path elements (ASCII letters, digits and `-._~+`, not `.` or `..`); other requests get a 404.
 
 ### Renaming repos during migration
 
@@ -104,7 +110,7 @@ env:
     value: "ssh -i /secrets/deploy-key -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 ```
 
-The key needs read access to every repository that will be probed: a repo the key can't read looks nonexistent (see *Not found vs. no access* above), so it's served from the next `repoPaths` entry instead.
+Probes never prompt: without a known host key or with a rejected key they fail (see *Misconfigured probes* above). The Docker image therefore ships `/etc/ssh/ssh_config.d/go-import-redirector.conf` with `StrictHostKeyChecking accept-new` and `BatchMode yes`, which applies even when `GIT_SSH_COMMAND` is set; mount your own `known_hosts` (or override that file) to pin host keys instead. Outside the image, pass the same options yourself as above. The key needs read access to every repository that will be probed: a repo the key can't read looks nonexistent (see *Not found vs. no access* above), so it's served from the next `repoPaths` entry instead.
 
 ## Running
 

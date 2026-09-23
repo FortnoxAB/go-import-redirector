@@ -5,10 +5,12 @@ import (
 	"context"
 	"log"
 	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type cacheEntry struct {
@@ -40,6 +42,24 @@ func logVerbose(format string, args ...any) {
 	if Verbose {
 		log.Printf(format, args...)
 	}
+}
+
+// killWaitDelay is how long cmd.Run may keep waiting for git's stdio to close
+// after the probe timeout killed it. Without it, a descendant that escaped
+// the kill (and still holds stderr) would stall the probe until it exits.
+const killWaitDelay = time.Second
+
+// maxLoggedStderr caps how much of git's stderr goes into a single log line.
+const maxLoggedStderr = 300
+
+// probeEnv is appended to the environment of every git subprocess so a probe
+// fails fast instead of waiting for input nobody will give: git must not ask
+// for HTTPS credentials, and ssh / Git Credential Manager must not fall back
+// to a GUI askpass helper (ssh already can't use a terminal, see isolate).
+var probeEnv = []string{
+	"GIT_TERMINAL_PROMPT=0",
+	"SSH_ASKPASS_REQUIRE=never",
+	"GCM_INTERACTIVE=never",
 }
 
 // evictSweepInterval throttles the full-map eviction scan in evictLocked so
@@ -171,8 +191,13 @@ func (p *Prober) probe(repoURL string, unreachableSince time.Time) bool {
 	logVerbose("gitprobe: probing %s", redactForLog(repoURL))
 
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(timeoutCtx, "git", "ls-remote", "--", repoURL)
+	// The HEAD pattern keeps the reply to one ref; existence is all we need,
+	// not every branch, tag and refs/pull/* of the repo.
+	cmd := exec.CommandContext(timeoutCtx, "git", "ls-remote", "--", repoURL, "HEAD")
+	cmd.Env = append(os.Environ(), probeEnv...)
 	cmd.Stderr = &stderr
+	cmd.WaitDelay = killWaitDelay
+	isolate(cmd)
 	err := cmd.Run()
 
 	now := time.Now()
@@ -197,9 +222,25 @@ func (p *Prober) probe(repoURL string, unreachableSince time.Time) bool {
 		return false
 	}
 
-	// Ambiguous error (network, SSH key rejected, timeout): safe default is "still exists"
+	// A misconfigured probe (unknown host key, rejected key or credentials)
+	// is answered by a reachable server and says nothing about whether the
+	// repo moved: keep serving the probed entry and don't start or advance
+	// outage tracking, so fixing the config rather than a silent fallover
+	// after unreachableTTL is what resolves it.
+	detail := logSafeStderr(stderr.String(), repoURL)
+	if isMisconfiguration(stderr.String()) {
+		log.Printf("gitprobe: %s: probe misconfigured, not counted as an outage: %v: %s", redactForLog(repoURL), err, detail)
+		assumeGone := !unreachableSince.IsZero() && now.Sub(unreachableSince) >= p.unreachableTTL
+		p.mu.Lock()
+		p.cache[repoURL] = cacheEntry{exists: !assumeGone, expires: now.Add(p.errorTTL), unreachableSince: unreachableSince}
+		p.evictLocked(now)
+		p.mu.Unlock()
+		return !assumeGone
+	}
+
+	// Ambiguous error (network, timeout): safe default is "still exists"
 	// unless we've been failing continuously longer than unreachableTTL.
-	log.Printf("gitprobe: %s: %v", redactForLog(repoURL), err)
+	log.Printf("gitprobe: %s: %v: %s", redactForLog(repoURL), err, detail)
 	if unreachableSince.IsZero() {
 		unreachableSince = now
 	}
@@ -222,6 +263,24 @@ func redactForLog(repoURL string) string {
 	}
 	u.User = url.User("redacted")
 	return u.String()
+}
+
+// logSafeStderr flattens git's stderr into one bounded line with control
+// characters removed (so it can't forge extra log lines) and repoURL's
+// credentials redacted, in case git echoes the URL back.
+func logSafeStderr(stderr, repoURL string) string {
+	s := strings.ReplaceAll(stderr, repoURL, redactForLog(repoURL))
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > maxLoggedStderr {
+		s = string(r[:maxLoggedStderr]) + "..."
+	}
+	return s
 }
 
 // evictLocked removes entries that no longer need tracking, then—if the
@@ -264,22 +323,49 @@ func (p *Prober) evictLocked(now time.Time) {
 // not found" both for a deleted repo and for a private repo the credentials
 // can't access — but a fully broken/revoked key surfaces as a distinct SSH-
 // level "Permission denied (publickey)" error instead (handled by the
-// ambiguous/unreachableTTL path), so in practice "not found" overwhelmingly
+// misconfiguration path), so in practice "not found" overwhelmingly
 // means "doesn't exist here (yet)", which matters for configs that probe the
 // new server first and fall back to a trusted old one: treating it as
 // ambiguous would serve a broken URL for every not-yet-migrated repo until
 // unreachableTTL elapses.
+//
+// "could not read username" is the HTTPS counterpart: a host that answers a
+// missing (or unreadable private) repo with 401 instead of 404, e.g. GitLab,
+// makes git ask for credentials, which probeEnv forbids. Same trade-off.
 var definitivelyGoneMarkers = []string{
 	"does not appear to be a git repository",
 	"repository not found",
 	"remote: not found",
+	"could not read username",
+}
+
+// misconfigurationMarkers lists stderr substrings from git ls-remote that
+// mean the probe itself is misconfigured for the whole host (unknown host
+// key, SSH key or HTTPS credentials rejected before any repo lookup), as
+// opposed to the host being unreachable or the repo being gone.
+var misconfigurationMarkers = []string{
+	"host key verification failed",
+	"permission denied (publickey",
+	"authentication failed",
 }
 
 // isDefinitivelyGone reports whether stderr from git ls-remote indicates the
 // repo was cleanly rejected (as opposed to a network or auth failure).
 func isDefinitivelyGone(stderr string) bool {
-	s := strings.ToLower(stderr)
-	for _, marker := range definitivelyGoneMarkers {
+	return containsAnyFold(stderr, definitivelyGoneMarkers)
+}
+
+// isMisconfiguration reports whether stderr from git ls-remote indicates the
+// probe's SSH/HTTPS setup was rejected by the host.
+func isMisconfiguration(stderr string) bool {
+	return containsAnyFold(stderr, misconfigurationMarkers)
+}
+
+// containsAnyFold reports whether s contains any of the lowercase markers,
+// ignoring case.
+func containsAnyFold(s string, markers []string) bool {
+	s = strings.ToLower(s)
+	for _, marker := range markers {
 		if strings.Contains(s, marker) {
 			return true
 		}

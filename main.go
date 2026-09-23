@@ -157,29 +157,75 @@ func parseMapping(imp string, repos []string) mapping {
 	if len(repos) == 0 {
 		log.Fatalf("mapping for %s has no repos", imp)
 	}
-	isWildcard := strings.HasSuffix(imp, "/*")
+	m := mapping{importPath: imp, repoPaths: append([]string(nil), repos...)}
+	for strings.HasSuffix(m.importPath, "/*") {
+		m.wildcard++
+		m.importPath = strings.TrimSuffix(m.importPath, "/*")
+	}
 	for _, r := range repos {
 		if !strings.Contains(r, "://") {
 			log.Fatalf("repo must be a full URL: %s", r)
 		}
 		// repoPaths use a literal "*" placeholder (optionally with a static suffix/prefix
 		// in the same segment, e.g. "*-go-lib" or "go-*", to rename a repo during migration).
-		// Exactly one "*" is required: candidate() only substitutes the first
-		// occurrence, so a second "*" would silently survive into the VCS URL.
+		// With one "*" it stands for the whole matched elem; with one "*" per
+		// import wildcard level (e.g. "org/*/go-*" for "import/*/*") each stands
+		// for one matched segment. Any other count would leave a "*" in the URL.
 		count := strings.Count(r, "*")
-		if isWildcard && count != 1 {
-			log.Fatalf("repo must contain exactly one \"*\" placeholder: %s", r)
-		}
-		if !isWildcard && count != 0 {
+		switch {
+		case m.wildcard == 0 && count != 0:
 			log.Fatalf("import and repos must have matching /* wildcards: %s vs %s", imp, r)
+		case m.wildcard == 1 && count != 1:
+			log.Fatalf("repo must contain exactly one \"*\" placeholder: %s", r)
+		case m.wildcard > 1 && count != 1 && count != m.wildcard:
+			log.Fatalf("repo must contain one \"*\" or %d (one per /* in %s): %s", m.wildcard, imp, r)
+		case m.wildcard > 1 && count == 1 && !isWholeSegmentStar(r):
+			// "go-*" would turn "a/b" into "go-a/b"; spell out one "*" per level instead.
+			log.Fatalf("a single \"*\" standing for %d path segments must be a whole segment: %s", m.wildcard, r)
 		}
-	}
-	m := mapping{importPath: imp, repoPaths: append([]string(nil), repos...)}
-	for strings.HasSuffix(m.importPath, "/*") {
-		m.wildcard++
-		m.importPath = strings.TrimSuffix(m.importPath, "/*")
 	}
 	return m
+}
+
+// isWholeSegmentStar reports whether r's only "*" is a whole path segment,
+// e.g. "https://host/org/*" or "https://host/*/repo".
+func isWholeSegmentStar(r string) bool {
+	i := strings.Index(r, "*")
+	return i > 0 && r[i-1] == '/' && (i+1 == len(r) || r[i+1] == '/')
+}
+
+// repoURL substitutes the matched wildcard elem ("a" or "a/b" for a
+// two-level wildcard) into repo path rp; see parseMapping for the forms.
+func (m mapping) repoURL(rp, elem string) string {
+	if m.wildcard == 0 {
+		return rp
+	}
+	if strings.Count(rp, "*") == 1 {
+		return strings.Replace(rp, "*", elem, 1)
+	}
+	for _, seg := range strings.Split(elem, "/") {
+		rp = strings.Replace(rp, "*", seg, 1)
+	}
+	return rp
+}
+
+// validElem reports whether every segment of a matched wildcard elem is a
+// valid Go import path element (ASCII letters, digits and "-._~+", not "."
+// or ".."). elem is substituted into VCS URLs and logged, so this keeps
+// "../" from escaping the configured repo prefix and control characters
+// (e.g. a %0A in the request path) from forging log lines.
+func validElem(elem string) bool {
+	for _, seg := range strings.Split(elem, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+		for _, r := range seg {
+			if !('a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9' || strings.ContainsRune("-._~+", r)) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func registerMapping(m mapping) {
@@ -225,7 +271,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 		if m.wildcard > 0 {
 			if path == m.importPath {
 				if *godocURL == "" {
-					logVerbose("handler: %s: no -godoc-url set, replying 404", path)
+					logVerbose("handler: %q: no -godoc-url set, replying 404", path)
 					http.NotFound(w, req)
 					return
 				}
@@ -233,7 +279,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 				return
 			}
 			if !strings.HasPrefix(path, m.importPath+"/") {
-				logVerbose("handler: %s: does not match importPath %q, replying 404", path, m.importPath)
+				logVerbose("handler: %q: does not match importPath %q, replying 404", path, m.importPath)
 				http.NotFound(w, req)
 				return
 			}
@@ -245,14 +291,19 @@ func makeHandler(m mapping) http.HandlerFunc {
 					suffix = "/" + suffix
 				}
 			} else {
-				logVerbose("handler: %s: not enough path elements for wildcard %q, replying 404", path, m.importPath)
+				logVerbose("handler: %q: not enough path elements for wildcard %q, replying 404", path, m.importPath)
+				http.NotFound(w, req)
+				return
+			}
+			if !validElem(elem) {
+				logVerbose("handler: %q: invalid import path element %q, replying 404", path, elem)
 				http.NotFound(w, req)
 				return
 			}
 			importRoot = m.importPath + "/" + elem
 		} else {
 			if path != m.importPath && !strings.HasPrefix(path, m.importPath+"/") {
-				logVerbose("handler: %s: does not match importPath %q, replying 404", path, m.importPath)
+				logVerbose("handler: %q: does not match importPath %q, replying 404", path, m.importPath)
 				http.NotFound(w, req)
 				return
 			}
@@ -262,7 +313,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 
 		if req.URL.Query().Get("go-get") != "1" {
 			if *godocURL == "" {
-				logVerbose("handler: %s: no go-get=1 and no -godoc-url set, replying 404", path)
+				logVerbose("handler: %q: no go-get=1 and no -godoc-url set, replying 404", path)
 				http.NotFound(w, req)
 				return
 			}
@@ -292,12 +343,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 // If an old server still has the repo → serve it. If all old servers are gone → serve last (new server).
 // Ambiguous errors default to serving the old server; persistent errors fall over to new.
 func resolveRepoPath(req *http.Request, m mapping, elem string) string {
-	candidate := func(rp string) string {
-		if m.wildcard > 0 {
-			return strings.Replace(rp, "*", elem, 1)
-		}
-		return rp
-	}
+	candidate := func(rp string) string { return m.repoURL(rp, elem) }
 	if len(m.repoPaths) == 1 {
 		return candidate(m.repoPaths[0])
 	}

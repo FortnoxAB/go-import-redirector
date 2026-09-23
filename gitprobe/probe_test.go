@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -35,13 +36,18 @@ func initRepo(t *testing.T) string {
 // control the simulated git ls-remote result.
 func stubGit(t *testing.T, sleep time.Duration, exitCode int, stderr string) {
 	t.Helper()
+	stubGitScript(t, fmt.Sprintf("sleep %f\n>&2 printf '%%s' %q\nexit %d\n", sleep.Seconds(), stderr, exitCode))
+}
+
+// stubGitScript installs a fake "git" whose body is the given sh script.
+func stubGitScript(t *testing.T, body string) {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("stub git script requires a POSIX shell")
 	}
 	dir := t.TempDir()
-	script := fmt.Sprintf("#!/bin/sh\nsleep %f\n>&2 printf '%%s' %q\nexit %d\n", sleep.Seconds(), stderr, exitCode)
 	path := filepath.Join(dir, "git")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -338,6 +344,99 @@ func TestProbeAmbiguousErrorEscalatesAfterUnreachableTTL(t *testing.T) {
 	}
 }
 
+// TestProbeMisconfigurationDoesNotEscalate verifies that host-level probe
+// misconfiguration (here an unknown host key) keeps serving the probed entry
+// instead of being mistaken for a migration once unreachableTTL elapses.
+func TestProbeMisconfigurationDoesNotEscalate(t *testing.T) {
+	stubGit(t, 0, 128, "Host key verification failed.\nfatal: Could not read from remote repository.")
+	const unreachableTTL = 50 * time.Millisecond
+	p := New(time.Hour, 10*time.Millisecond, unreachableTTL, 5*time.Second)
+	const url = "ssh://example.invalid/misconfigured-repo"
+
+	if got := p.Probe(context.Background(), url); got != true {
+		t.Fatalf("expected misconfiguration to keep exists=true, got %v", got)
+	}
+	time.Sleep(unreachableTTL + 20*time.Millisecond)
+	if got := p.Probe(context.Background(), url); got != true {
+		t.Errorf("expected misconfiguration not to escalate to gone after unreachableTTL, got %v", got)
+	}
+	p.mu.Lock()
+	e := p.cache[url]
+	p.mu.Unlock()
+	if !e.unreachableSince.IsZero() {
+		t.Errorf("expected no outage tracking for a misconfiguration, got unreachableSince=%v", e.unreachableSince)
+	}
+}
+
+// TestProbeTimeoutKillsDescendants is a regression test for a timed-out
+// probe waiting on a git descendant (e.g. ssh stuck in connect) that still
+// holds stderr: the whole process group must be killed at the timeout.
+func TestProbeTimeoutKillsDescendants(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group kill is unix-only")
+	}
+	stubGitScript(t, "sleep 10 &\nwait\n") // background child inherits stderr
+	const timeout = 200 * time.Millisecond
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, timeout)
+
+	start := time.Now()
+	p.Probe(context.Background(), "ssh://example.invalid/hanging-repo")
+	// Well under timeout+killWaitDelay, so passing needs the group kill,
+	// not just the WaitDelay backstop.
+	if elapsed := time.Since(start); elapsed >= timeout+killWaitDelay/2 {
+		t.Errorf("probe took %v after a %v timeout; descendants were not killed", elapsed, timeout)
+	}
+}
+
+// TestProbeInvocation checks the git command line and environment: a HEAD
+// pattern so only one ref is listed, and prompts disabled so a probe can't
+// wait on credentials.
+func TestProbeInvocation(t *testing.T) {
+	stubGitScript(t, `[ "$1 $2 $4" = "ls-remote -- HEAD" ] && [ "$GIT_TERMINAL_PROMPT" = 0 ] && [ "$SSH_ASKPASS_REQUIRE" = never ] && exit 0
+>&2 echo "remote: Repository not found."
+exit 128
+`)
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
+	if !p.Probe(context.Background(), "ssh://example.invalid/invocation-repo") {
+		t.Error("unexpected git arguments or environment")
+	}
+}
+
+func TestLogSafeStderr(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Host key verification failed.\r\nfatal: Could not read from remote repository.\n", "Host key verification failed. fatal: Could not read from remote repository."},
+		{"fatal: bad\x1b[31m\x00 thing\ngitprobe: forged", "fatal: bad [31m thing gitprobe: forged"},
+		{"fatal: unable to access 'ssh://user:secret@example.com/repo'", "fatal: unable to access 'ssh://redacted@example.com/repo'"},
+	}
+	for _, c := range cases {
+		if got := logSafeStderr(c.in, "ssh://user:secret@example.com/repo"); got != c.want {
+			t.Errorf("logSafeStderr(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	long := logSafeStderr(strings.Repeat("x", 2*maxLoggedStderr), "")
+	if len(long) != maxLoggedStderr+len("...") {
+		t.Errorf("expected stderr truncated to %d chars plus ellipsis, got %d", maxLoggedStderr, len(long))
+	}
+}
+
+func TestIsMisconfiguration(t *testing.T) {
+	cases := []struct {
+		stderr string
+		want   bool
+	}{
+		{"Host key verification failed.", true},
+		{"git@github.com: Permission denied (publickey).", true},
+		{"fatal: Authentication failed for 'https://example.com/repo/'", true},
+		{"ssh: connect to host example.com port 22: Connection timed out", false},
+		{"remote: Repository not found.", false},
+	}
+	for _, c := range cases {
+		if got := isMisconfiguration(c.stderr); got != c.want {
+			t.Errorf("isMisconfiguration(%q) = %v, want %v", c.stderr, got, c.want)
+		}
+	}
+}
+
 func TestEvictLockedRemovesExpiredKeepsOutageTrackingAndBoundsSize(t *testing.T) {
 	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
 	now := time.Now()
@@ -410,6 +509,7 @@ func TestIsDefinitivelyGone(t *testing.T) {
 		{"fatal: 'x' does not appear to be a git repository", true},
 		{"DOES NOT APPEAR TO BE A GIT REPOSITORY", true},
 		{"remote: Repository not found.", true}, // treated as gone, not ambiguous; see definitivelyGoneMarkers
+		{"fatal: could not read Username for 'https://gitlab.example.com': terminal prompts disabled", true},
 		{"fatal: could not read from remote repository", false},
 		{"", false},
 	}
