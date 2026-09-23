@@ -25,6 +25,11 @@ const maxCacheEntries = 10000
 // requests for many distinct wildcard names can't exhaust process/CPU/memory.
 const maxConcurrentProbes = 32
 
+// maxPendingProbes bounds how many distinct URLs can have a probe in flight
+// (running or waiting for one of the maxConcurrentProbes slots). Beyond it,
+// Probe answers from the last known result instead of queueing more work.
+const maxPendingProbes = 4 * maxConcurrentProbes
+
 // Verbose enables logging of every probe attempt (not just found/not-found
 // state changes and errors). Intended to be set once at startup from a CLI
 // flag; noisy in production if left on.
@@ -61,7 +66,7 @@ type Prober struct {
 // probe instead of racing to write the cache entry out of order.
 type probeCall struct {
 	done   chan struct{}
-	result bool
+	result bool // set before done is closed
 }
 
 // New returns a Prober. errorTTL controls retry interval on ambiguous errors;
@@ -73,12 +78,18 @@ func New(ttl, errorTTL, unreachableTTL, timeout time.Duration) *Prober {
 		unreachableTTL: unreachableTTL,
 		timeout:        timeout,
 		cache:          make(map[string]cacheEntry),
+		inflight:       make(map[string]*probeCall),
 		sem:            make(chan struct{}, maxConcurrentProbes),
 	}
 }
 
 // Probe returns true if the repo at repoURL still exists.
 // false means definitively gone or unreachable long enough to assume migration.
+//
+// ctx only bounds how long this caller waits: the git probe itself runs
+// detached from any caller, so one client disconnecting can neither abort a
+// probe other callers have joined nor leave them with a result that was never
+// actually probed. A canceled caller gets the last known result instead.
 func (p *Prober) Probe(ctx context.Context, repoURL string) bool {
 	p.mu.Lock()
 	e, ok := p.cache[repoURL]
@@ -89,67 +100,72 @@ func (p *Prober) Probe(ctx context.Context, repoURL string) bool {
 	// Join an in-flight probe for the same URL instead of racing it: two
 	// concurrent probes can finish out of order and the slower one would
 	// otherwise overwrite a fresher cache entry.
-	if c, inflight := p.inflight[repoURL]; inflight {
-		p.mu.Unlock()
-		select {
-		case <-c.done:
-			return c.result
-		case <-ctx.Done():
-			// Our own context gave up before the in-flight probe finished;
-			// says nothing about the repo, so fall back to the last known
-			// result like the other cancellation paths in this file.
-			p.mu.Lock()
-			e, ok := p.cache[repoURL]
+	c, inflight := p.inflight[repoURL]
+	if !inflight {
+		// Probes outlive their callers, so without a cap a flood of distinct
+		// wildcard names would pile up goroutines waiting for a probe slot.
+		if len(p.inflight) >= maxPendingProbes {
 			p.mu.Unlock()
-			if ok {
-				return e.exists
-			}
-			return true
+			logVerbose("gitprobe: %s: %d probes already pending, using last known result", redactForLog(repoURL), maxPendingProbes)
+			return lastKnown(e, ok)
 		}
+		c = &probeCall{done: make(chan struct{})}
+		p.inflight[repoURL] = c
+		go p.run(c, repoURL, e.unreachableSince)
 	}
-	c := &probeCall{done: make(chan struct{})}
-	if p.inflight == nil {
-		p.inflight = make(map[string]*probeCall)
-	}
-	p.inflight[repoURL] = c
-	unreachableSince := e.unreachableSince
 	p.mu.Unlock()
 
-	result := p.probe(ctx, repoURL, unreachableSince)
+	select {
+	case <-c.done:
+		return c.result
+	case <-ctx.Done():
+		p.mu.Lock()
+		e, ok := p.cache[repoURL]
+		p.mu.Unlock()
+		return lastKnown(e, ok)
+	}
+}
 
+// run performs the probe for c and publishes its result to every waiter.
+func (p *Prober) run(c *probeCall, repoURL string, unreachableSince time.Time) {
+	c.result = p.probe(repoURL, unreachableSince)
 	p.mu.Lock()
 	delete(p.inflight, repoURL)
 	p.mu.Unlock()
-	c.result = result
 	close(c.done)
-	return result
 }
 
-func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince time.Time) bool {
-	// Bound the wait for a free probe slot by p.timeout too, so -probe-timeout
-	// caps total latency even when all slots are busy. This budget is only
-	// for acquiring a slot: the git subprocess below gets its own fresh
-	// p.timeout once started, so slot contention can never eat into (and
-	// thus falsely time out) the actual probe.
-	waitCtx, waitCancel := context.WithTimeout(ctx, p.timeout)
+// lastKnown is the answer when no fresh probe result is available: the
+// cached result if there is one, else the documented safe default "exists".
+func lastKnown(e cacheEntry, ok bool) bool {
+	if ok {
+		return e.exists
+	}
+	return true
+}
+
+func (p *Prober) probe(repoURL string, unreachableSince time.Time) bool {
+	// Bound the wait for a free probe slot by p.timeout too, so a probe can't
+	// sit pending forever when all slots are busy. This budget is only for
+	// acquiring a slot: the git subprocess below gets its own fresh p.timeout
+	// once started, so slot contention can never eat into (and thus falsely
+	// time out) the actual probe.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), p.timeout)
 	defer waitCancel()
 
 	select {
 	case p.sem <- struct{}{}:
 		defer func() { <-p.sem }()
 	case <-waitCtx.Done():
-		// Caller gave up waiting for a free probe slot; says nothing about
-		// the repo, so don't touch the cache or outage tracking.
+		// No free probe slot in time; says nothing about the repo, so don't
+		// touch the cache or outage tracking.
 		p.mu.Lock()
 		e, ok := p.cache[repoURL]
 		p.mu.Unlock()
-		if ok {
-			return e.exists
-		}
-		return true
+		return lastKnown(e, ok)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
 
 	logVerbose("gitprobe: probing %s", redactForLog(repoURL))
@@ -171,7 +187,9 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 
 	// Definitively gone: repo not found (not a transient error)
 	if isDefinitivelyGone(stderr.String()) {
-		log.Printf("gitprobe: %s: not found", redactForLog(repoURL))
+		// Hosts also say "not found" when the key can't read a private repo,
+		// which can't be told apart here; say so in the log.
+		log.Printf("gitprobe: %s: not found (or no read access)", redactForLog(repoURL))
 		p.mu.Lock()
 		p.cache[repoURL] = cacheEntry{exists: false, expires: now.Add(p.ttl)}
 		p.evictLocked(now)
@@ -179,21 +197,7 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 		return false
 	}
 
-	// The caller (HTTP request) was canceled/disconnected or hit its own
-	// deadline before our own timeout elapsed; that says nothing about the
-	// repo, so leave the cache and outage tracking untouched and fall back
-	// to the last known result.
-	if ctx.Err() != nil {
-		p.mu.Lock()
-		e, ok := p.cache[repoURL]
-		p.mu.Unlock()
-		if ok {
-			return e.exists
-		}
-		return true
-	}
-
-	// Ambiguous error (network, auth, timeout): safe default is "still exists"
+	// Ambiguous error (network, SSH key rejected, timeout): safe default is "still exists"
 	// unless we've been failing continuously longer than unreachableTTL.
 	log.Printf("gitprobe: %s: %v", redactForLog(repoURL), err)
 	if unreachableSince.IsZero() {

@@ -155,29 +155,38 @@ func TestProbeInflightJoinCancelNoCacheDefaultsExists(t *testing.T) {
 	}
 }
 
-// TestProbeCallerCancelFallsBackToCache verifies that if the caller's own
-// context is canceled mid-probe (as opposed to our own timeout elapsing),
-// the result falls back to the last cached value instead of touching it.
+// TestProbeCallerCancelFallsBackToCache verifies that a caller whose context
+// is canceled mid-probe gets the last cached value, while the probe itself
+// keeps running detached from that caller and still refreshes the cache.
 func TestProbeCallerCancelFallsBackToCache(t *testing.T) {
-	stubGit(t, 2*time.Second, 0, "")
+	stubGit(t, 300*time.Millisecond, 0, "")
 	const url = "ssh://example.invalid/repo"
 	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
 	p.mu.Lock()
-	p.cache[url] = cacheEntry{exists: true, expires: time.Now().Add(-time.Second)} // expired
+	p.cache[url] = cacheEntry{exists: false, expires: time.Now().Add(-time.Second)} // expired
 	p.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(50*time.Millisecond, cancel)
-	if got := p.Probe(ctx, url); got != true {
-		t.Errorf("expected fallback to cached exists=true on caller cancellation, got %v", got)
+	if got := p.Probe(ctx, url); got != false {
+		t.Errorf("expected fallback to cached exists=false on caller cancellation, got %v", got)
+	}
+
+	waitInflight(t, p, url)
+	p.mu.Lock()
+	e := p.cache[url]
+	p.mu.Unlock()
+	if !e.exists {
+		t.Error("expected the probe to finish despite caller cancellation and cache exists=true")
 	}
 }
 
 // TestProbeCallerDeadlineDoesNotRecordOutage verifies that a request-level
-// deadline is treated the same as other caller-driven cancellations: it must
-// not create or update outage tracking for the repo.
+// deadline is treated the same as other caller-driven cancellations: the
+// caller gets the safe default, and it must not create or update outage
+// tracking for the repo once the detached probe completes.
 func TestProbeCallerDeadlineDoesNotRecordOutage(t *testing.T) {
-	stubGit(t, 2*time.Second, 0, "")
+	stubGit(t, 300*time.Millisecond, 0, "")
 	const url = "ssh://example.invalid/deadline-repo"
 	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
 
@@ -187,11 +196,82 @@ func TestProbeCallerDeadlineDoesNotRecordOutage(t *testing.T) {
 		t.Fatalf("expected safe default exists=true on caller deadline, got %v", got)
 	}
 
+	waitInflight(t, p, url)
 	p.mu.Lock()
-	_, ok := p.cache[url]
+	e, ok := p.cache[url]
 	p.mu.Unlock()
-	if ok {
-		t.Fatal("expected caller deadline to leave cache and outage tracking untouched")
+	if !ok || !e.exists || !e.unreachableSince.IsZero() {
+		t.Fatalf("expected the detached probe to cache a plain success, got %+v (present=%v)", e, ok)
+	}
+}
+
+// TestProbeJoinerUnaffectedByStarterCancel guards against the caller that
+// started a probe aborting it for everyone who joined it.
+func TestProbeJoinerUnaffectedByStarterCancel(t *testing.T) {
+	stubGit(t, 300*time.Millisecond, 0, "")
+	const url = "ssh://example.invalid/shared-repo"
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
+	p.mu.Lock()
+	p.cache[url] = cacheEntry{exists: false, expires: time.Now().Add(-time.Second)} // expired
+	p.mu.Unlock()
+
+	starterCtx, cancel := context.WithCancel(context.Background())
+	go p.Probe(starterCtx, url)
+	for {
+		p.mu.Lock()
+		_, inflight := p.inflight[url]
+		p.mu.Unlock()
+		if inflight {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	if got := p.Probe(context.Background(), url); got != true {
+		t.Errorf("expected joiner to get the real probe result exists=true, got %v", got)
+	}
+}
+
+// TestProbePendingCapFallsBack verifies that once maxPendingProbes URLs are
+// already in flight, a probe for a new URL is not queued and the caller gets
+// the last known result (here: none cached, so the safe default).
+func TestProbePendingCapFallsBack(t *testing.T) {
+	const url = "file:///whatever-pending-cap-test" // would probe as not found if it ran
+	p := New(time.Hour, 30*time.Second, 15*time.Minute, 5*time.Second)
+	p.mu.Lock()
+	for i := range maxPendingProbes {
+		p.inflight[fmt.Sprintf("pending-%d", i)] = &probeCall{done: make(chan struct{})}
+	}
+	p.mu.Unlock()
+
+	if got := p.Probe(context.Background(), url); got != true {
+		t.Errorf("expected safe default exists=true when pending probes are capped, got %v", got)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.inflight[url]; ok {
+		t.Error("expected no probe to be queued beyond maxPendingProbes")
+	}
+	if len(p.inflight) != maxPendingProbes {
+		t.Errorf("expected %d pending probes, got %d", maxPendingProbes, len(p.inflight))
+	}
+}
+
+// waitInflight blocks until any in-flight probe for url has finished, so a
+// detached probe doesn't outlive the test that started it.
+func waitInflight(t *testing.T, p *Prober, url string) {
+	t.Helper()
+	p.mu.Lock()
+	c, ok := p.inflight[url]
+	p.mu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case <-c.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for in-flight probe")
 	}
 }
 
