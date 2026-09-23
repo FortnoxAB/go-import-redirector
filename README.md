@@ -119,7 +119,7 @@ go-import-redirector rsc.io/* ssh://git@github.com/rsc/*
 | Flag | Default | Description |
 |---|---|---|
 | `-config` | | Path to JSON config file. |
-| `-addr` | `:http` | Address to listen on. |
+| `-addr` | `:8080` | Address to listen on. |
 | `-vcs` | `git` | VCS type for the `go-import` tag. |
 | `-godoc-url` | | URL to redirect browsers to (non-`go-get` requests). |
 | `-probe-cache-ttl` | `10m` | How long to cache definitive probe results (repo found or cleanly not found). |
