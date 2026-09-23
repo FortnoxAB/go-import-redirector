@@ -155,7 +155,7 @@ func (p *Prober) probe(ctx context.Context, repoURL string, unreachableSince tim
 	logVerbose("gitprobe: probing %s", redactForLog(repoURL))
 
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(timeoutCtx, "git", "ls-remote", repoURL)
+	cmd := exec.CommandContext(timeoutCtx, "git", "ls-remote", "--", repoURL)
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 
