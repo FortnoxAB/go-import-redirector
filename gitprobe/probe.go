@@ -224,18 +224,18 @@ func (p *Prober) probe(repoURL string, unreachableSince time.Time) bool {
 
 	// A misconfigured probe (unknown host key, rejected key or credentials)
 	// is answered by a reachable server and says nothing about whether the
-	// repo moved: keep serving the probed entry and don't start or advance
-	// outage tracking, so fixing the config rather than a silent fallover
-	// after unreachableTTL is what resolves it.
+	// repo moved: keep serving the probed entry and reset outage tracking
+	// (the server answered, so any earlier outage is over), so fixing the
+	// config rather than a silent fallover after unreachableTTL is what
+	// resolves it.
 	detail := logSafeStderr(stderr.String(), repoURL)
 	if isMisconfiguration(stderr.String()) {
 		log.Printf("gitprobe: %s: probe misconfigured, not counted as an outage: %v: %s", redactForLog(repoURL), err, detail)
-		assumeGone := !unreachableSince.IsZero() && now.Sub(unreachableSince) >= p.unreachableTTL
 		p.mu.Lock()
-		p.cache[repoURL] = cacheEntry{exists: !assumeGone, expires: now.Add(p.errorTTL), unreachableSince: unreachableSince}
+		p.cache[repoURL] = cacheEntry{exists: true, expires: now.Add(p.errorTTL)}
 		p.evictLocked(now)
 		p.mu.Unlock()
-		return !assumeGone
+		return true
 	}
 
 	// Ambiguous error (network, timeout): safe default is "still exists"

@@ -368,6 +368,31 @@ func TestProbeMisconfigurationDoesNotEscalate(t *testing.T) {
 	}
 }
 
+// TestProbeMisconfigurationResetsPriorOutage verifies that a misconfigured
+// probe clears an outage accumulated by earlier ambiguous errors, rather than
+// letting that old timer expire and fail a healthy repo over.
+func TestProbeMisconfigurationResetsPriorOutage(t *testing.T) {
+	stubGit(t, 0, 128, "Host key verification failed.\nfatal: Could not read from remote repository.")
+	const unreachableTTL = 50 * time.Millisecond
+	p := New(time.Hour, 10*time.Millisecond, unreachableTTL, 5*time.Second)
+	const url = "ssh://example.invalid/previously-flaky-repo"
+
+	now := time.Now()
+	p.mu.Lock()
+	p.cache[url] = cacheEntry{exists: true, expires: now.Add(-time.Second), unreachableSince: now.Add(-2 * unreachableTTL)}
+	p.mu.Unlock()
+
+	if got := p.Probe(context.Background(), url); got != true {
+		t.Errorf("expected misconfiguration to keep exists=true despite a prior outage, got %v", got)
+	}
+	p.mu.Lock()
+	e := p.cache[url]
+	p.mu.Unlock()
+	if !e.exists || !e.unreachableSince.IsZero() {
+		t.Errorf("expected misconfiguration to reset outage tracking, got exists=%v unreachableSince=%v", e.exists, e.unreachableSince)
+	}
+}
+
 // TestProbeTimeoutKillsDescendants is a regression test for a timed-out
 // probe waiting on a git descendant (e.g. ssh stuck in connect) that still
 // holds stderr: the whole process group must be killed at the timeout.
