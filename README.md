@@ -22,11 +22,9 @@ For each request the service:
 2. Probes each `repoPaths` entry **except the last** via `git ls-remote`, in order, to check whether the repo is there.
 3. Serves the first entry that's found. Once none of the probed entries have the repo, the last entry is served automatically — it is never probed, it's the trusted default.
 
-Probe results are cached (`-probe-cache-ttl`, default 10 minutes). Ambiguous errors (network outage, timeout) are retried after a shorter interval (`-probe-error-ttl`, default 30 seconds) and default to "still there" for whichever entry is being probed — so a transient outage never wrongly flips traffic. If an entry has been unreachable for longer than `-probe-unreachable-ttl` (default 15 minutes), it is treated as gone and the next entry in the list is served instead.
+A probe either succeeds (the repo is there) or fails, and a failure counts as "not there" whatever the reason — repo not found, no read access, network outage, timeout, rejected SSH key or unknown host key. Either result is cached for `-probe-cache-ttl` (default 10 minutes). Failures are logged together with git's error message.
 
-**Not found vs. no access:** GitHub and Bitbucket answer `Repository not found` both when a repo doesn't exist and when the probe's key authenticates but can't read that (private) repo. The service can't tell these apart, so both count as "gone" and it falls over to the next entry immediately — treating them as ambiguous would instead serve a broken URL for every not-yet-migrated repo in a new-first config until `-probe-unreachable-ttl` elapses. The flip side: if the probe key loses read access to a probed server, its repos fall over at once. Hosts that answer such requests over HTTPS with `401` instead (e.g. GitLab) are treated the same way, since probes never prompt for credentials. These probes are logged as `not found (or no read access)`; see [SSH configuration](#ssh-configuration).
-
-**Misconfigured probes:** errors that come from the probe's own setup rather than the repo — an unknown SSH host key, or an SSH key or HTTPS credentials the host rejects outright — say nothing about whether a repo moved. They keep serving the probed entry and never count towards `-probe-unreachable-ttl`, so a broken deployment can't silently fail everything over after 15 minutes. They're logged as `probe misconfigured` together with git's error message.
+When a request gets no probe answer — the client disconnects, no probe slot frees up within `-probe-timeout`, or too many probes are already pending — it uses the last cached result for that entry, or treats it as not there if nothing is cached. These answers are not cached; a probe already running in the background still caches its own result when it finishes.
 
 The order of `repoPaths` decides which server is trusted by default: put the old server first and the new one last to migrate only once the old repo is confirmed gone (the classic case), or the other way around to switch to the new server as soon as it exists, without waiting for the old one to be decommissioned (see `redirects.example.json`, which checks GitHub first and falls back to the old server).
 
@@ -110,7 +108,7 @@ env:
     value: "ssh -i /secrets/deploy-key -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 ```
 
-Probes never prompt: without a known host key or with a rejected key they fail (see *Misconfigured probes* above). The Docker image therefore ships `/etc/ssh/ssh_config.d/go-import-redirector.conf` with `StrictHostKeyChecking accept-new` and `BatchMode yes`, which applies even when `GIT_SSH_COMMAND` is set; mount your own `known_hosts` (or override that file) to pin host keys instead. Outside the image, pass the same options yourself as above. The key needs read access to every repository that will be probed: a repo the key can't read looks nonexistent (see *Not found vs. no access* above), so it's served from the next `repoPaths` entry instead.
+Probes never prompt: without a known host key or with a rejected key they fail. The Docker image therefore ships `/etc/ssh/ssh_config.d/go-import-redirector.conf` with `StrictHostKeyChecking accept-new` and `BatchMode yes`, which applies even when `GIT_SSH_COMMAND` is set; mount your own `known_hosts` (or override that file) to pin host keys instead. Outside the image, pass the same options yourself as above. The key needs read access to every repository that will be probed: a repo the key can't read looks nonexistent, so it's served from the next `repoPaths` entry instead.
 
 ## Running
 
@@ -130,9 +128,7 @@ go-import-redirector rsc.io/* ssh://git@github.com/rsc/*
 | `-addr` | `:8080` | Address to listen on. |
 | `-vcs` | `git` | VCS type for the `go-import` tag. |
 | `-godoc-url` | | URL to redirect browsers to (non-`go-get` requests). |
-| `-probe-cache-ttl` | `10m` | How long to cache definitive probe results (repo found or cleanly not found). |
-| `-probe-error-ttl` | `30s` | How long to cache ambiguous errors (network, timeout, SSH key rejected) before retry. |
-| `-probe-unreachable-ttl` | `15m` | Treat an old server as gone if it has been unreachable this long. |
+| `-probe-cache-ttl` | `10m` | How long to cache probe results (found or not). |
 | `-probe-timeout` | `5s` | Timeout per `git ls-remote` probe. |
 
 ## Building

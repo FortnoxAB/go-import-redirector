@@ -14,9 +14,8 @@ import (
 )
 
 type cacheEntry struct {
-	exists           bool
-	expires          time.Time
-	unreachableSince time.Time // non-zero while consecutive ambiguous errors persist
+	exists  bool
+	expires time.Time
 }
 
 // maxCacheEntries bounds cache size so an attacker requesting many distinct
@@ -67,19 +66,16 @@ var probeEnv = []string{
 const evictSweepInterval = time.Minute
 
 // Prober checks git repo existence via git ls-remote and caches results.
-// A definitive "not found" and a repo that has been unreachable longer than
-// unreachableTTL are both treated as gone. Ambiguous errors (network, auth)
-// are cached briefly and default to "still exists" until the timeout elapses.
+// A successful ls-remote means the repo exists; any failure, whatever the
+// reason, means it doesn't. Both results are cached for ttl.
 type Prober struct {
-	ttl            time.Duration
-	errorTTL       time.Duration // short TTL for ambiguous errors
-	unreachableTTL time.Duration // treat persistent errors as "gone" after this
-	timeout        time.Duration
-	mu             sync.Mutex
-	cache          map[string]cacheEntry
-	inflight       map[string]*probeCall // serializes concurrent probes of the same URL
-	sem            chan struct{}         // bounds concurrent git subprocesses across all URLs
-	nextSweep      time.Time             // evictLocked skips the full scan until this time, unless oversized
+	ttl       time.Duration
+	timeout   time.Duration
+	mu        sync.Mutex
+	cache     map[string]cacheEntry
+	inflight  map[string]*probeCall // serializes concurrent probes of the same URL
+	sem       chan struct{}         // bounds concurrent git subprocesses across all URLs
+	nextSweep time.Time             // evictLocked skips the full scan until this time, unless oversized
 }
 
 // probeCall lets concurrent callers for the same URL share one in-flight
@@ -89,27 +85,26 @@ type probeCall struct {
 	result bool // set before done is closed
 }
 
-// New returns a Prober. errorTTL controls retry interval on ambiguous errors;
-// unreachableTTL is how long errors must persist before assuming the repo is gone.
-func New(ttl, errorTTL, unreachableTTL, timeout time.Duration) *Prober {
+// New returns a Prober that caches probe results for ttl and gives each git
+// ls-remote at most timeout to finish.
+func New(ttl, timeout time.Duration) *Prober {
 	return &Prober{
-		ttl:            ttl,
-		errorTTL:       errorTTL,
-		unreachableTTL: unreachableTTL,
-		timeout:        timeout,
-		cache:          make(map[string]cacheEntry),
-		inflight:       make(map[string]*probeCall),
-		sem:            make(chan struct{}, maxConcurrentProbes),
+		ttl:      ttl,
+		timeout:  timeout,
+		cache:    make(map[string]cacheEntry),
+		inflight: make(map[string]*probeCall),
+		sem:      make(chan struct{}, maxConcurrentProbes),
 	}
 }
 
-// Probe returns true if the repo at repoURL still exists.
-// false means definitively gone or unreachable long enough to assume migration.
+// Probe returns true if git ls-remote of repoURL succeeds, false if it fails
+// for any reason.
 //
 // ctx only bounds how long this caller waits: the git probe itself runs
 // detached from any caller, so one client disconnecting can neither abort a
 // probe other callers have joined nor leave them with a result that was never
-// actually probed. A canceled caller gets the last known result instead.
+// actually probed. A canceled caller gets the last known result instead, or
+// false if there is none.
 func (p *Prober) Probe(ctx context.Context, repoURL string) bool {
 	p.mu.Lock()
 	e, ok := p.cache[repoURL]
@@ -131,7 +126,7 @@ func (p *Prober) Probe(ctx context.Context, repoURL string) bool {
 		}
 		c = &probeCall{done: make(chan struct{})}
 		p.inflight[repoURL] = c
-		go p.run(c, repoURL, e.unreachableSince)
+		go p.run(c, repoURL)
 	}
 	p.mu.Unlock()
 
@@ -147,8 +142,8 @@ func (p *Prober) Probe(ctx context.Context, repoURL string) bool {
 }
 
 // run performs the probe for c and publishes its result to every waiter.
-func (p *Prober) run(c *probeCall, repoURL string, unreachableSince time.Time) {
-	c.result = p.probe(repoURL, unreachableSince)
+func (p *Prober) run(c *probeCall, repoURL string) {
+	c.result = p.probe(repoURL)
 	p.mu.Lock()
 	delete(p.inflight, repoURL)
 	p.mu.Unlock()
@@ -156,15 +151,13 @@ func (p *Prober) run(c *probeCall, repoURL string, unreachableSince time.Time) {
 }
 
 // lastKnown is the answer when no fresh probe result is available: the
-// cached result if there is one, else the documented safe default "exists".
+// cached result if there is one, else false, since no answer counts as not
+// found.
 func lastKnown(e cacheEntry, ok bool) bool {
-	if ok {
-		return e.exists
-	}
-	return true
+	return ok && e.exists
 }
 
-func (p *Prober) probe(repoURL string, unreachableSince time.Time) bool {
+func (p *Prober) probe(repoURL string) bool {
 	// Bound the wait for a free probe slot by p.timeout too, so a probe can't
 	// sit pending forever when all slots are busy. This budget is only for
 	// acquiring a slot: the git subprocess below gets its own fresh p.timeout
@@ -178,7 +171,7 @@ func (p *Prober) probe(repoURL string, unreachableSince time.Time) bool {
 		defer func() { <-p.sem }()
 	case <-waitCtx.Done():
 		// No free probe slot in time; says nothing about the repo, so don't
-		// touch the cache or outage tracking.
+		// touch the cache.
 		p.mu.Lock()
 		e, ok := p.cache[repoURL]
 		p.mu.Unlock()
@@ -200,59 +193,18 @@ func (p *Prober) probe(repoURL string, unreachableSince time.Time) bool {
 	isolate(cmd)
 	err := cmd.Run()
 
-	now := time.Now()
-	if err == nil {
+	exists := err == nil
+	if exists {
 		logVerbose("gitprobe: %s: found", redactForLog(repoURL))
-		p.mu.Lock()
-		p.cache[repoURL] = cacheEntry{exists: true, expires: now.Add(p.ttl)}
-		p.evictLocked(now)
-		p.mu.Unlock()
-		return true
+	} else {
+		log.Printf("gitprobe: %s: not found: %v: %s", redactForLog(repoURL), err, logSafeStderr(stderr.String(), repoURL))
 	}
-
-	// Definitively gone: repo not found (not a transient error)
-	if isDefinitivelyGone(stderr.String()) {
-		// Hosts also say "not found" when the key can't read a private repo,
-		// which can't be told apart here; say so in the log.
-		log.Printf("gitprobe: %s: not found (or no read access)", redactForLog(repoURL))
-		p.mu.Lock()
-		p.cache[repoURL] = cacheEntry{exists: false, expires: now.Add(p.ttl)}
-		p.evictLocked(now)
-		p.mu.Unlock()
-		return false
-	}
-
-	// A misconfigured probe (unknown host key, rejected key or credentials)
-	// is answered by a reachable server and says nothing about whether the
-	// repo moved: keep serving the probed entry and reset outage tracking
-	// (the server answered, so any earlier outage is over), so fixing the
-	// config rather than a silent fallover after unreachableTTL is what
-	// resolves it.
-	detail := logSafeStderr(stderr.String(), repoURL)
-	if isMisconfiguration(stderr.String()) {
-		log.Printf("gitprobe: %s: probe misconfigured, not counted as an outage: %v: %s", redactForLog(repoURL), err, detail)
-		p.mu.Lock()
-		p.cache[repoURL] = cacheEntry{exists: true, expires: now.Add(p.errorTTL)}
-		p.evictLocked(now)
-		p.mu.Unlock()
-		return true
-	}
-
-	// Ambiguous error (network, timeout): safe default is "still exists"
-	// unless we've been failing continuously longer than unreachableTTL.
-	log.Printf("gitprobe: %s: %v: %s", redactForLog(repoURL), err, detail)
-	if unreachableSince.IsZero() {
-		unreachableSince = now
-	}
-	assumeGone := now.Sub(unreachableSince) >= p.unreachableTTL
-	if assumeGone {
-		log.Printf("gitprobe: %s unreachable since %s, assuming migrated", redactForLog(repoURL), unreachableSince.Format(time.RFC3339))
-	}
+	now := time.Now()
 	p.mu.Lock()
-	p.cache[repoURL] = cacheEntry{exists: !assumeGone, expires: now.Add(p.errorTTL), unreachableSince: unreachableSince}
+	p.cache[repoURL] = cacheEntry{exists: exists, expires: now.Add(p.ttl)}
 	p.evictLocked(now)
 	p.mu.Unlock()
-	return !assumeGone
+	return exists
 }
 
 // redactForLog strips credentials from a repo URL's userinfo before logging.
@@ -283,7 +235,7 @@ func logSafeStderr(stderr, repoURL string) string {
 	return s
 }
 
-// evictLocked removes entries that no longer need tracking, then—if the
+// evictLocked removes expired entries, then—if the
 // cache is still oversized—falls back to dropping the oldest entries so
 // memory use stays bounded regardless of how many distinct keys are probed.
 // The full scan is throttled to evictSweepInterval (bypassed immediately if
@@ -298,9 +250,7 @@ func (p *Prober) evictLocked(now time.Time) {
 	p.nextSweep = now.Add(evictSweepInterval)
 
 	for k, e := range p.cache {
-		// unreachableSince must persist past expiry to track outages across
-		// errorTTL cycles, so only reap entries that no longer need that.
-		if e.unreachableSince.IsZero() && now.After(e.expires) {
+		if now.After(e.expires) {
 			delete(p.cache, k)
 		}
 	}
@@ -315,60 +265,4 @@ func (p *Prober) evictLocked(now time.Time) {
 		}
 		delete(p.cache, k)
 	}
-}
-
-// definitivelyGoneMarkers lists stderr substrings from git ls-remote that
-// mean "treat this repoPath as gone", triggering immediate fallover instead
-// of waiting out unreachableTTL. GitHub (and other hosts) return "repository
-// not found" both for a deleted repo and for a private repo the credentials
-// can't access — but a fully broken/revoked key surfaces as a distinct SSH-
-// level "Permission denied (publickey)" error instead (handled by the
-// misconfiguration path), so in practice "not found" overwhelmingly
-// means "doesn't exist here (yet)", which matters for configs that probe the
-// new server first and fall back to a trusted old one: treating it as
-// ambiguous would serve a broken URL for every not-yet-migrated repo until
-// unreachableTTL elapses.
-//
-// "could not read username" is the HTTPS counterpart: a host that answers a
-// missing (or unreadable private) repo with 401 instead of 404, e.g. GitLab,
-// makes git ask for credentials, which probeEnv forbids. Same trade-off.
-var definitivelyGoneMarkers = []string{
-	"does not appear to be a git repository",
-	"repository not found",
-	"remote: not found",
-	"could not read username",
-}
-
-// misconfigurationMarkers lists stderr substrings from git ls-remote that
-// mean the probe itself is misconfigured for the whole host (unknown host
-// key, SSH key or HTTPS credentials rejected before any repo lookup), as
-// opposed to the host being unreachable or the repo being gone.
-var misconfigurationMarkers = []string{
-	"host key verification failed",
-	"permission denied (publickey",
-	"authentication failed",
-}
-
-// isDefinitivelyGone reports whether stderr from git ls-remote indicates the
-// repo was cleanly rejected (as opposed to a network or auth failure).
-func isDefinitivelyGone(stderr string) bool {
-	return containsAnyFold(stderr, definitivelyGoneMarkers)
-}
-
-// isMisconfiguration reports whether stderr from git ls-remote indicates the
-// probe's SSH/HTTPS setup was rejected by the host.
-func isMisconfiguration(stderr string) bool {
-	return containsAnyFold(stderr, misconfigurationMarkers)
-}
-
-// containsAnyFold reports whether s contains any of the lowercase markers,
-// ignoring case.
-func containsAnyFold(s string, markers []string) bool {
-	s = strings.ToLower(s)
-	for _, marker := range markers {
-		if strings.Contains(s, marker) {
-			return true
-		}
-	}
-	return false
 }

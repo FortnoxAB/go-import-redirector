@@ -39,15 +39,13 @@ import (
 )
 
 var (
-	addr                = flag.String("addr", ":8080", "serve http on `address`")
-	vcs                 = flag.String("vcs", "git", "set version control `system`")
-	godocURL            = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
-	config              = flag.String("config", os.Getenv("CONFIG"), "path to JSON config file (see redirects.example.json); defaults to the CONFIG env var")
-	probeCacheTTL       = flag.Duration("probe-cache-ttl", 10*time.Minute, "how long to cache definitive probe results")
-	probeErrorTTL       = flag.Duration("probe-error-ttl", 30*time.Second, "how long to cache ambiguous probe errors before retry")
-	probeUnreachableTTL = flag.Duration("probe-unreachable-ttl", 15*time.Minute, "assume repo migrated if old server is unreachable this long")
-	probeTimeout        = flag.Duration("probe-timeout", 5*time.Second, "timeout per git ls-remote probe")
-	verbose             = flag.Bool("verbose", envBool("VERBOSE", false), "log every request and probe attempt (noisy); defaults to the VERBOSE env var")
+	addr          = flag.String("addr", ":8080", "serve http on `address`")
+	vcs           = flag.String("vcs", "git", "set version control `system`")
+	godocURL      = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
+	config        = flag.String("config", os.Getenv("CONFIG"), "path to JSON config file (see redirects.example.json); defaults to the CONFIG env var")
+	probeCacheTTL = flag.Duration("probe-cache-ttl", 10*time.Minute, "how long to cache probe results (found or not)")
+	probeTimeout  = flag.Duration("probe-timeout", 5*time.Second, "timeout per git ls-remote probe")
+	verbose       = flag.Bool("verbose", envBool("VERBOSE", false), "log every request and probe attempt (noisy); defaults to the VERBOSE env var")
 )
 
 // envBool reads a boolean from the named environment variable, falling back
@@ -111,9 +109,8 @@ func main() {
 	*godocURL = strings.TrimRight(*godocURL, "/")
 	gitprobe.Verbose = *verbose
 
-	prober = gitprobe.New(*probeCacheTTL, *probeErrorTTL, *probeUnreachableTTL, *probeTimeout)
-	log.Printf("git SSH probing enabled (cache TTL: %v, error TTL: %v, unreachable TTL: %v)",
-		*probeCacheTTL, *probeErrorTTL, *probeUnreachableTTL)
+	prober = gitprobe.New(*probeCacheTTL, *probeTimeout)
+	log.Printf("git SSH probing enabled (cache TTL: %v, timeout: %v)", *probeCacheTTL, *probeTimeout)
 
 	if *config != "" {
 		f, err := os.Open(*config)
@@ -341,7 +338,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 
 // resolveRepoPath probes the first entries (old servers) to detect migration.
 // If an old server still has the repo → serve it. If all old servers are gone → serve last (new server).
-// Ambiguous errors default to serving the old server; persistent errors fall over to new.
+// A probe that fails for any reason counts as gone.
 func resolveRepoPath(req *http.Request, m mapping, elem string) string {
 	candidate := func(rp string) string { return m.repoURL(rp, elem) }
 	if len(m.repoPaths) == 1 {
