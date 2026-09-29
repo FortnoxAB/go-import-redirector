@@ -108,7 +108,7 @@ env:
     value: "ssh -i /secrets/deploy-key -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 ```
 
-Probes never prompt: without a known host key or with a rejected key they fail. The Docker image therefore ships `/etc/ssh/ssh_config.d/go-import-redirector.conf` with `StrictHostKeyChecking accept-new` and `BatchMode yes`, which applies even when `GIT_SSH_COMMAND` is set; mount your own `known_hosts` (or override that file) to pin host keys instead. Outside the image, pass the same options yourself as above. The key needs read access to every repository that will be probed: a repo the key can't read looks nonexistent, so it's served from the next `repoPaths` entry instead.
+Probes never prompt: without a known host key or with a rejected key they fail. The Docker image therefore ships `/etc/ssh/ssh_config.d/go-import-redirector.conf` with `StrictHostKeyChecking accept-new`, `BatchMode yes` and `UserKnownHostsFile /tmp/known_hosts` (writable whatever UID the pod runs as), which applies even when `GIT_SSH_COMMAND` is set; mount your own `known_hosts` (or override that file) to pin host keys instead. Outside the image, pass the same options yourself as above. The key needs read access to every repository that will be probed: a repo the key can't read looks nonexistent, so it's served from the next `repoPaths` entry instead.
 
 ## Running
 
