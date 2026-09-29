@@ -133,6 +133,10 @@ func main() {
 	} else {
 		usage()
 	}
+	// Host-independent health check for liveness/readiness probes: the
+	// per-mapping importPath+"/.ping" only answers under an import path
+	// (e.g. go.example.com/team/.ping), not at the host root.
+	http.HandleFunc("/.ping", pong)
 
 	log.Printf("listening on %s", *addr)
 	if err := http.ListenAndServe(*addr, logRequests(http.DefaultServeMux)); err != nil {
