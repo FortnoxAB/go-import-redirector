@@ -1,0 +1,4 @@
+*.exe
+go-import-redirector
+redirects.json
+.env
