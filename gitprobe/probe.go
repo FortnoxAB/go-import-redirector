@@ -61,21 +61,32 @@ var probeEnv = []string{
 	"GCM_INTERACTIVE=never",
 }
 
+// Defaults for how hard a probe tries before it gives up. A failed ls-remote
+// is retried so a short blip (network, server hiccup) isn't mistaken for the
+// repo being gone, which would then be cached for the full ttl.
+const (
+	defaultProbeAttempts = 3
+	defaultRetryDelay    = 500 * time.Millisecond
+)
+
 // evictSweepInterval throttles the full-map eviction scan in evictLocked so
 // it runs periodically rather than on every single cache write.
 const evictSweepInterval = time.Minute
 
 // Prober checks git repo existence via git ls-remote and caches results.
-// A successful ls-remote means the repo exists; any failure, whatever the
-// reason, means it doesn't. Both results are cached for ttl.
+// A successful ls-remote means the repo exists. A failed one is retried, and
+// once every attempt failed, whatever the reason, the repo counts as not
+// there. Either result is cached for ttl.
 type Prober struct {
-	ttl       time.Duration
-	timeout   time.Duration
-	mu        sync.Mutex
-	cache     map[string]cacheEntry
-	inflight  map[string]*probeCall // serializes concurrent probes of the same URL
-	sem       chan struct{}         // bounds concurrent git subprocesses across all URLs
-	nextSweep time.Time             // evictLocked skips the full scan until this time, unless oversized
+	ttl        time.Duration
+	timeout    time.Duration
+	attempts   int           // ls-remote attempts per probe
+	retryDelay time.Duration // pause between attempts
+	mu         sync.Mutex
+	cache      map[string]cacheEntry
+	inflight   map[string]*probeCall // serializes concurrent probes of the same URL
+	sem        chan struct{}         // bounds concurrent git subprocesses across all URLs
+	nextSweep  time.Time             // evictLocked skips the full scan until this time, unless oversized
 }
 
 // probeCall lets concurrent callers for the same URL share one in-flight
@@ -89,16 +100,18 @@ type probeCall struct {
 // ls-remote at most timeout to finish.
 func New(ttl, timeout time.Duration) *Prober {
 	return &Prober{
-		ttl:      ttl,
-		timeout:  timeout,
-		cache:    make(map[string]cacheEntry),
-		inflight: make(map[string]*probeCall),
-		sem:      make(chan struct{}, maxConcurrentProbes),
+		ttl:        ttl,
+		timeout:    timeout,
+		attempts:   defaultProbeAttempts,
+		retryDelay: defaultRetryDelay,
+		cache:      make(map[string]cacheEntry),
+		inflight:   make(map[string]*probeCall),
+		sem:        make(chan struct{}, maxConcurrentProbes),
 	}
 }
 
-// Probe returns true if git ls-remote of repoURL succeeds, false if it fails
-// for any reason.
+// Probe returns true if git ls-remote of repoURL succeeds, false if every
+// attempt fails, for any reason.
 //
 // ctx only bounds how long this caller waits: the git probe itself runs
 // detached from any caller, so one client disconnecting can neither abort a
@@ -178,10 +191,37 @@ func (p *Prober) probe(repoURL string) bool {
 		return lastKnown(e, ok)
 	}
 
+	var err error
+	var stderr string
+	for attempt := 1; attempt <= p.attempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(p.retryDelay)
+		}
+		logVerbose("gitprobe: probing %s (attempt %d/%d)", redactForLog(repoURL), attempt, p.attempts)
+		if stderr, err = p.lsRemote(repoURL); err == nil {
+			break
+		}
+		logVerbose("gitprobe: %s: attempt %d/%d failed: %v: %s", redactForLog(repoURL), attempt, p.attempts, err, logSafeStderr(stderr, repoURL))
+	}
+
+	exists := err == nil
+	if exists {
+		logVerbose("gitprobe: %s: found", redactForLog(repoURL))
+	} else {
+		log.Printf("gitprobe: %s: not found after %d attempts: %v: %s", redactForLog(repoURL), p.attempts, err, logSafeStderr(stderr, repoURL))
+	}
+	now := time.Now()
+	p.mu.Lock()
+	p.cache[repoURL] = cacheEntry{exists: exists, expires: now.Add(p.ttl)}
+	p.evictLocked(now)
+	p.mu.Unlock()
+	return exists
+}
+
+// lsRemote runs one git ls-remote of repoURL and returns its stderr and error.
+func (p *Prober) lsRemote(repoURL string) (string, error) {
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
-
-	logVerbose("gitprobe: probing %s", redactForLog(repoURL))
 
 	var stderr bytes.Buffer
 	// The HEAD pattern keeps the reply to one ref; existence is all we need,
@@ -192,19 +232,7 @@ func (p *Prober) probe(repoURL string) bool {
 	cmd.WaitDelay = killWaitDelay
 	isolate(cmd)
 	err := cmd.Run()
-
-	exists := err == nil
-	if exists {
-		logVerbose("gitprobe: %s: found", redactForLog(repoURL))
-	} else {
-		log.Printf("gitprobe: %s: not found: %v: %s", redactForLog(repoURL), err, logSafeStderr(stderr.String(), repoURL))
-	}
-	now := time.Now()
-	p.mu.Lock()
-	p.cache[repoURL] = cacheEntry{exists: exists, expires: now.Add(p.ttl)}
-	p.evictLocked(now)
-	p.mu.Unlock()
-	return exists
+	return stderr.String(), err
 }
 
 // redactForLog strips credentials from a repo URL's userinfo before logging.
