@@ -22,7 +22,7 @@ For each request the service:
 2. Probes each `repoPaths` entry **except the last** via `git ls-remote`, in order, to check whether the repo is there.
 3. Serves the first entry that's found. Once none of the probed entries have the repo, the last entry is served automatically — it is never probed, it's the trusted default.
 
-A probe either succeeds (the repo is there) or fails, and a failure counts as "not there" whatever the reason — repo not found, no read access, network outage, timeout, rejected SSH key or unknown host key. Either result is cached for `-probe-cache-ttl` (default 10 minutes). Failures are logged together with git's error message.
+A probe either succeeds (the repo is there) or fails. A failed `git ls-remote` is retried up to 3 attempts in total, 500ms apart, so a short blip on the server or network isn't mistaken for a missing repo; each attempt gets its own `-probe-timeout`. Once every attempt has failed, the repo counts as "not there" whatever the reason — repo not found, no read access, network outage, timeout, rejected SSH key or unknown host key. Either result is cached for `-probe-cache-ttl` (default 10 minutes). Failures are logged together with git's error message.
 
 When a request gets no probe answer — the client disconnects, no probe slot frees up within `-probe-timeout`, or too many probes are already pending — it uses the last cached result for that entry, or treats it as not there if nothing is cached. These answers are not cached; a probe already running in the background still caches its own result when it finishes.
 
@@ -129,7 +129,7 @@ go-import-redirector rsc.io/* ssh://git@github.com/rsc/*
 | `-vcs` | `git` | VCS type for the `go-import` tag. |
 | `-godoc-url` | | URL to redirect browsers to (non-`go-get` requests). |
 | `-probe-cache-ttl` | `10m` | How long to cache probe results (found or not). |
-| `-probe-timeout` | `5s` | Timeout per `git ls-remote` probe. |
+| `-probe-timeout` | `5s` | Timeout per `git ls-remote` attempt (a probe makes up to 3). |
 
 ## Building
 

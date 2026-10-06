@@ -44,7 +44,7 @@ var (
 	godocURL      = flag.String("godoc-url", "", "URL to send the browser to if not fetched using go get")
 	config        = flag.String("config", os.Getenv("CONFIG"), "path to JSON config file (see redirects.example.json); defaults to the CONFIG env var")
 	probeCacheTTL = flag.Duration("probe-cache-ttl", 10*time.Minute, "how long to cache probe results (found or not)")
-	probeTimeout  = flag.Duration("probe-timeout", 5*time.Second, "timeout per git ls-remote probe")
+	probeTimeout  = flag.Duration("probe-timeout", 5*time.Second, "timeout per git ls-remote attempt (a probe makes up to 3)")
 	verbose       = flag.Bool("verbose", envBool("VERBOSE", false), "log every request and probe attempt (noisy); defaults to the VERBOSE env var")
 )
 

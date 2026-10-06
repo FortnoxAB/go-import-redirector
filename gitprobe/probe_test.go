@@ -87,6 +87,54 @@ func TestProbeFailureCachedAsNotFound(t *testing.T) {
 	}
 }
 
+// TestProbeRetriesBlip checks that a probe whose first attempts fail (a blip)
+// retries and reports the repo found once an attempt succeeds.
+func TestProbeRetriesBlip(t *testing.T) {
+	count := filepath.Join(t.TempDir(), "count")
+	// Fail the first two calls, succeed on the third.
+	stubGitScript(t, fmt.Sprintf(`echo x >> %q
+[ "$(wc -l < %q)" -ge 3 ] && exit 0
+>&2 echo "ssh: connect to host example.invalid port 22: Connection timed out"
+exit 128
+`, count, count))
+	const url = "ssh://example.invalid/blip-repo"
+	p := New(time.Hour, 5*time.Second)
+	p.retryDelay = time.Millisecond
+	if !p.Probe(context.Background(), url) {
+		t.Error("expected a probe that succeeds on retry to report found")
+	}
+	if got := countLines(t, count); got != 3 {
+		t.Errorf("expected 3 git invocations, got %d", got)
+	}
+}
+
+// TestProbeGivesUpAfterAttempts checks that a probe stops after p.attempts
+// failed attempts and reports not found.
+func TestProbeGivesUpAfterAttempts(t *testing.T) {
+	count := filepath.Join(t.TempDir(), "count")
+	stubGitScript(t, fmt.Sprintf(`echo x >> %q
+>&2 echo "ERROR: Repository not found."
+exit 128
+`, count))
+	p := New(time.Hour, 5*time.Second)
+	p.retryDelay = time.Millisecond
+	if p.Probe(context.Background(), "ssh://example.invalid/missing-repo") {
+		t.Error("expected not found after every attempt failed")
+	}
+	if got := countLines(t, count); got != defaultProbeAttempts {
+		t.Errorf("expected %d git invocations, got %d", defaultProbeAttempts, got)
+	}
+}
+
+func countLines(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(b), "\n")
+}
+
 func TestProbeCachesHit(t *testing.T) {
 	skipIfNoGit(t)
 	url := "file://" + initRepo(t)
@@ -328,6 +376,7 @@ func TestProbeTimeoutKillsDescendants(t *testing.T) {
 	stubGitScript(t, "sleep 10 &\nwait\n") // background child inherits stderr
 	const timeout = 200 * time.Millisecond
 	p := New(time.Hour, timeout)
+	p.attempts = 1 // time a single attempt, not the retries
 
 	start := time.Now()
 	p.Probe(context.Background(), "ssh://example.invalid/hanging-repo")
