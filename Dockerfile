@@ -4,9 +4,12 @@ FROM alpine:3.22
 # never prompt. System-wide, so it still applies when GIT_SSH_COMMAND is set.
 # Accepted keys go to /tmp, which is writable whatever UID the pod runs as
 # (e.g. runAsUser: 65534, whose home "/" is not).
-RUN apk add --no-cache git openssh-client \
+# tini is PID 1 so it reaps the ssh processes git orphans when ls-remote fails:
+# the Go binary never wait()s on children it did not start, so without an init
+# every failed probe leaves a zombie behind.
+RUN apk add --no-cache git openssh-client tini \
  && printf 'Host *\n    StrictHostKeyChecking accept-new\n    BatchMode yes\n    UserKnownHostsFile /tmp/known_hosts\n' > /etc/ssh/ssh_config.d/go-import-redirector.conf \
  && adduser -S -D -h /home/redirector redirector
 COPY go-import-redirector /
 USER redirector
-ENTRYPOINT ["/go-import-redirector"]
+ENTRYPOINT ["/sbin/tini", "--", "/go-import-redirector"]
