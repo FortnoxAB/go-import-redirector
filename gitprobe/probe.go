@@ -193,7 +193,8 @@ func (p *Prober) probe(repoURL string) bool {
 
 	var err error
 	var stderr string
-	for attempt := 1; attempt <= p.attempts; attempt++ {
+	attempt := 1
+	for ; attempt <= p.attempts; attempt++ {
 		if attempt > 1 {
 			time.Sleep(p.retryDelay)
 		}
@@ -202,13 +203,19 @@ func (p *Prober) probe(repoURL string) bool {
 			break
 		}
 		logVerbose("gitprobe: %s: attempt %d/%d failed: %v: %s", redactForLog(repoURL), attempt, p.attempts, err, logSafeStderr(stderr, repoURL))
+		if definitiveNotFound(stderr) {
+			break
+		}
+	}
+	if attempt > p.attempts {
+		attempt = p.attempts
 	}
 
 	exists := err == nil
 	if exists {
 		logVerbose("gitprobe: %s: found", redactForLog(repoURL))
 	} else {
-		log.Printf("gitprobe: %s: not found after %d attempts: %v: %s", redactForLog(repoURL), p.attempts, err, logSafeStderr(stderr, repoURL))
+		log.Printf("gitprobe: %s: not found after %d attempts: %v: %s", redactForLog(repoURL), attempt, err, logSafeStderr(stderr, repoURL))
 	}
 	now := time.Now()
 	p.mu.Lock()
@@ -216,6 +223,14 @@ func (p *Prober) probe(repoURL string) bool {
 	p.evictLocked(now)
 	p.mu.Unlock()
 	return exists
+}
+
+// definitiveNotFound reports whether git's stderr is the server saying the
+// repo does not exist (GitHub's "ERROR: Repository not found."). That answer
+// is deterministic, so retrying only spawns more git/ssh processes for the
+// same result. Anything else (timeouts, connection errors) may be a blip.
+func definitiveNotFound(stderr string) bool {
+	return strings.Contains(stderr, "Repository not found")
 }
 
 // lsRemote runs one git ls-remote of repoURL and returns its stderr and error.

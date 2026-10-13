@@ -113,16 +113,36 @@ exit 128
 func TestProbeGivesUpAfterAttempts(t *testing.T) {
 	count := filepath.Join(t.TempDir(), "count")
 	stubGitScript(t, fmt.Sprintf(`echo x >> %q
+>&2 echo "ssh: connect to host example.invalid port 22: Connection timed out"
+exit 128
+`, count))
+	p := New(time.Hour, 5*time.Second)
+	p.retryDelay = time.Millisecond
+	if p.Probe(context.Background(), "ssh://example.invalid/unreachable-repo") {
+		t.Error("expected not found after every attempt failed")
+	}
+	if got := countLines(t, count); got != defaultProbeAttempts {
+		t.Errorf("expected %d git invocations, got %d", defaultProbeAttempts, got)
+	}
+}
+
+// TestProbeNoRetryOnRepositoryNotFound checks that the server's definitive
+// "Repository not found" answer is not retried, since every retry only
+// spawns more git/ssh processes for the same result.
+func TestProbeNoRetryOnRepositoryNotFound(t *testing.T) {
+	count := filepath.Join(t.TempDir(), "count")
+	stubGitScript(t, fmt.Sprintf(`echo x >> %q
 >&2 echo "ERROR: Repository not found."
+>&2 echo "fatal: Could not read from remote repository."
 exit 128
 `, count))
 	p := New(time.Hour, 5*time.Second)
 	p.retryDelay = time.Millisecond
 	if p.Probe(context.Background(), "ssh://example.invalid/missing-repo") {
-		t.Error("expected not found after every attempt failed")
+		t.Error("expected not found")
 	}
-	if got := countLines(t, count); got != defaultProbeAttempts {
-		t.Errorf("expected %d git invocations, got %d", defaultProbeAttempts, got)
+	if got := countLines(t, count); got != 1 {
+		t.Errorf("expected 1 git invocation, got %d", got)
 	}
 }
 
