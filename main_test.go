@@ -70,6 +70,40 @@ func TestHandlerProberMiss(t *testing.T) {
 	assertGoImport(t, body, "go.example.com/team/myrepo", "git", "ssh://git@github.com/my-org/myrepo")
 }
 
+func TestHandlerGitHubRootServesGoSource(t *testing.T) {
+	setProber(t, nil)
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@git.example.com/team/*", "ssh://git@github.com/my-org/*"})
+	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
+	want := `<meta name="go-source" content="go.example.com/team/myrepo https://github.com/my-org/myrepo `
+	if !strings.Contains(body, want) {
+		t.Errorf("go-source meta not found\nwant: %s\ngot:  %s", want, body)
+	}
+}
+
+func TestHandlerNonGitHubRootOmitsGoSource(t *testing.T) {
+	setProber(t, map[string]bool{"ssh://git@git.example.com/team/myrepo": true})
+	m := parseMapping("go.example.com/team/*", []string{"ssh://git@git.example.com/team/*", "ssh://git@github.com/my-org/*"})
+	body := handlerResponse(t, makeHandler(m), "go.example.com", "/team/myrepo")
+	if strings.Contains(body, "go-source") {
+		t.Errorf("go-source meta should be omitted for non-GitHub roots\ngot: %s", body)
+	}
+}
+
+func TestGithubSourceURL(t *testing.T) {
+	tests := map[string]string{
+		"ssh://git@github.com/my-org/myrepo":     "https://github.com/my-org/myrepo",
+		"ssh://git@github.com/my-org/myrepo.git": "https://github.com/my-org/myrepo",
+		"https://github.com/my-org/myrepo":       "https://github.com/my-org/myrepo",
+		"ssh://git@git.example.com:7999/team/x":  "",
+		"ssh://git@github.com.evil.com/org/repo": "",
+	}
+	for in, want := range tests {
+		if got := githubSourceURL(in); got != want {
+			t.Errorf("githubSourceURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestHandlerMajorVersionSuffix(t *testing.T) {
 	// old server still has the repo
 	setProber(t, map[string]bool{"ssh://git@git.example.com/team/myrepo": true})
