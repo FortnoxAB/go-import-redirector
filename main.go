@@ -30,6 +30,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -243,6 +244,8 @@ var tmpl = template.Must(template.New("main").Parse(`<!DOCTYPE html>
 <head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
 <meta name="go-import" content="{{.ImportRoot}} {{.VCS}} {{.VCSRoot}}">
+{{if .SourceURL}}<meta name="go-source" content="{{.ImportRoot}} {{.SourceURL}} {{.SourceURL}}/tree/HEAD{/dir} {{.SourceURL}}/blob/HEAD{/dir}/{file}#L{line}">
+{{end -}}
 <meta http-equiv="refresh" content="0; url={{.GoDocURL}}/{{.ImportRoot}}{{.Suffix}}">
 </head>
 <body>
@@ -255,8 +258,20 @@ type data struct {
 	ImportRoot string
 	VCS        string
 	VCSRoot    string
+	SourceURL  string
 	Suffix     string
 	GoDocURL   string
+}
+
+// githubSourceURL returns the https URL of a GitHub VCS root, or "" for other hosts.
+// The go command ignores go-source, so developers keep cloning over ssh. Renovate reads
+// go-source before go-import and cannot look up versions from an ssh URL.
+func githubSourceURL(vcsRoot string) string {
+	u, err := url.Parse(vcsRoot)
+	if err != nil || u.Hostname() != "github.com" {
+		return ""
+	}
+	return "https://github.com" + strings.TrimSuffix(u.Path, ".git")
 }
 
 func makeHandler(m mapping) http.HandlerFunc {
@@ -328,6 +343,7 @@ func makeHandler(m mapping) http.HandlerFunc {
 			ImportRoot: importRoot,
 			VCS:        *vcs,
 			VCSRoot:    vcsRoot,
+			SourceURL:  githubSourceURL(vcsRoot),
 			Suffix:     suffix,
 			GoDocURL:   *godocURL,
 		}
